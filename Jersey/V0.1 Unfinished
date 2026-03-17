@@ -1,0 +1,891 @@
+local Players        = game:GetService("Players")
+local TweenService   = game:GetService("TweenService")
+local ContentProvider= game:GetService("ContentProvider")
+
+local player    = Players.LocalPlayer
+local PlayerGui = player:WaitForChild("PlayerGui")
+
+if PlayerGui:FindFirstChild("UFBarstoolJerseys") then
+	PlayerGui.UFBarstoolJerseys:Destroy()
+end
+
+------------------------------------------------------------------------
+-- ENGINE
+------------------------------------------------------------------------
+local function normalizeId(raw)
+	if not raw or raw == "" then return nil end
+	if raw:match("^rbxassetid://%d+$") then return raw end
+	local n = raw:match("rbxassetid://(%d+)") or raw:match("[?&]id=(%d+)") or raw:match("^%s*(%d+)%s*$")
+	return n and ("rbxassetid://"..n) or nil
+end
+
+local function cloneSwapHandle(acc, fn)
+	local h = acc:FindFirstChild("Handle"); if not h then return false end
+	local nh = h:Clone()
+	if not pcall(fn, nh) then nh:Destroy(); return false end
+	local cf = h.CFrame
+	nh.Anchored = false; h:Destroy(); nh.Parent = acc; nh.CFrame = cf
+	local char = acc.Parent
+	if char then
+		local fa = nh:FindFirstChildOfClass("Attachment")
+		if fa then
+			for _, d in ipairs(char:GetDescendants()) do
+				if d:IsA("Attachment") and d.Name == fa.Name and d.Parent ~= nh then
+					local bp = d.Parent
+					if bp and bp:IsA("BasePart") then
+						local ia = false
+						pcall(function() ia = bp.Parent:IsA("Accessory") end)
+						if not ia then
+							nh.CFrame = d.WorldCFrame * fa.CFrame:Inverse()
+							local wc = Instance.new("WeldConstraint")
+							wc.Part0 = nh; wc.Part1 = bp; wc.Parent = nh; break
+						end
+					end
+				end
+			end
+		end
+	end
+	return true
+end
+
+local function applyTexture(acc, texId)
+	return cloneSwapHandle(acc, function(h)
+		if h:IsA("MeshPart") then h.TextureID = texId
+		else
+			local sm = h:FindFirstChildOfClass("SpecialMesh")
+			if sm then sm.TextureId = texId end
+		end
+	end)
+end
+
+-- groups[i] = { name, slots={[accName]=texId}, players={username,...} }
+local detectedJerseys = {}
+local groups          = {}
+local activeGroupIdx  = nil
+local watchConns      = {}
+local charConns       = {}
+local cooldowns       = {}
+
+local function activeGroup()
+	return activeGroupIdx and groups[activeGroupIdx] or nil
+end
+
+local function texForPlayer(username, accName)
+	local g = activeGroup()
+	return g and g.slots[accName] or nil
+end
+
+local function pushToChar(rp)
+	local char = rp.Character; if not char then return end
+	task.spawn(function()
+		task.wait(0.12)
+		for _, child in ipairs(char:GetChildren()) do
+			if child:IsA("Accessory") and child.Name:sub(1,7) == "JERSEY_" then
+				local tex = texForPlayer(rp.Name, child.Name)
+				if tex then
+					local lk = rp.UserId..child.Name
+					if not cooldowns[lk] then
+						cooldowns[lk] = true
+						task.delay(0.5, function() cooldowns[lk] = nil end)
+						pcall(function() ContentProvider:PreloadAsync({tex}) end)
+						applyTexture(child, tex)
+					end
+				end
+			end
+		end
+	end)
+end
+
+local function pushToAll()
+	local ag = activeGroup(); if not ag then return end
+	for _, username in ipairs(ag.players) do
+		for _, rp in ipairs(Players:GetPlayers()) do
+			if rp.Name:lower() == username:lower() then
+				pushToChar(rp); break
+			end
+		end
+	end
+end
+
+local function watchAcc(rp, acc)
+	local key = rp.UserId..acc.Name; if watchConns[key] then return end
+	local conns = {}
+	local h = acc:FindFirstChild("Handle")
+	if h then
+		local function recheck()
+			local tex = texForPlayer(rp.Name, acc.Name); if not tex then return end
+			local lk = rp.UserId..acc.Name
+			if not cooldowns[lk] then
+				task.spawn(function() task.wait(0.04); applyTexture(acc, tex) end)
+			end
+		end
+		local ok1,c1 = pcall(function()
+			return h:GetPropertyChangedSignal("TextureID"):Connect(recheck)
+		end)
+		if ok1 then table.insert(conns,c1) end
+		local sm = h:FindFirstChildOfClass("SpecialMesh")
+		if sm then
+			local ok2,c2 = pcall(function()
+				return sm:GetPropertyChangedSignal("TextureId"):Connect(recheck)
+			end)
+			if ok2 then table.insert(conns,c2) end
+		end
+	end
+	watchConns[key] = conns
+end
+
+local function setupWatch(rp)
+	local function onChar(char)
+		task.wait(0.18)
+		for _, child in ipairs(char:GetChildren()) do
+			if child:IsA("Accessory") and child.Name:sub(1,7) == "JERSEY_" then
+				watchAcc(rp, child)
+			end
+		end
+		char.ChildAdded:Connect(function(child)
+			if child:IsA("Accessory") and child.Name:sub(1,7) == "JERSEY_" then
+				task.wait(0.1); watchAcc(rp, child)
+				local tex = texForPlayer(rp.Name, child.Name)
+				if tex then
+					task.spawn(function()
+						task.wait(0.14)
+						pcall(function() ContentProvider:PreloadAsync({tex}) end)
+						applyTexture(child, tex)
+					end)
+				end
+			end
+		end)
+		pushToChar(rp)
+	end
+	if rp.Character then onChar(rp.Character) end
+	if not charConns[rp.UserId] then charConns[rp.UserId] = {} end
+	table.insert(charConns[rp.UserId], rp.CharacterAdded:Connect(onChar))
+end
+
+local function doActivateGroup(idx)
+	for _, conns in pairs(charConns) do
+		for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	end
+	for _, conns in pairs(watchConns) do
+		for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	end
+	charConns = {}; watchConns = {}; activeGroupIdx = idx
+	local ag = activeGroup()
+	if not ag then return end
+	for _, username in ipairs(ag.players) do
+		for _, rp in ipairs(Players:GetPlayers()) do
+			if rp.Name:lower() == username:lower() then
+				setupWatch(rp); break
+			end
+		end
+	end
+	Players.PlayerAdded:Connect(function(rp)
+		if activeGroupIdx ~= idx then return end
+		local ag2 = activeGroup(); if not ag2 then return end
+		for _, u in ipairs(ag2.players) do
+			if u:lower() == rp.Name:lower() then setupWatch(rp); break end
+		end
+	end)
+	pushToAll()
+end
+
+------------------------------------------------------------------------
+-- PALETTE
+------------------------------------------------------------------------
+local BG     = Color3.fromRGB(9,9,12)
+local SURF   = Color3.fromRGB(14,14,20)
+local CARD   = Color3.fromRGB(19,19,27)
+local CARD2  = Color3.fromRGB(24,24,34)
+local INPBG  = Color3.fromRGB(11,11,16)
+local BDR    = Color3.fromRGB(36,36,50)
+local BDRHI  = Color3.fromRGB(100,100,150)
+local WHITE  = Color3.fromRGB(255,255,255)
+local OFF    = Color3.fromRGB(205,205,220)
+local DIM    = Color3.fromRGB(115,115,145)
+local MUT    = Color3.fromRGB(58,58,78)
+local GRN    = Color3.fromRGB(88,210,118)
+local GRNBG  = Color3.fromRGB(12,32,16)
+local GRNhi  = Color3.fromRGB(160,240,180)
+local RED    = Color3.fromRGB(215,72,72)
+local REDBG  = Color3.fromRGB(32,11,11)
+local AMBER  = Color3.fromRGB(255,185,50)
+
+------------------------------------------------------------------------
+-- PRIMITIVES
+------------------------------------------------------------------------
+local function cr(i,r) local c=Instance.new("UICorner",i); c.CornerRadius=UDim.new(0,r or 8); return c end
+local function sk(i,c,t) local s=Instance.new("UIStroke",i); s.Color=c or BDR; s.Thickness=t or 1; return s end
+local function pd(i,l,t,r,b)
+	local p=Instance.new("UIPadding",i)
+	p.PaddingLeft=UDim.new(0,l or 0); p.PaddingTop=UDim.new(0,t or 0)
+	p.PaddingRight=UDim.new(0,r or 0); p.PaddingBottom=UDim.new(0,b or 0)
+end
+local function vl(i,g)
+	local l=Instance.new("UIListLayout",i); l.FillDirection=Enum.FillDirection.Vertical
+	l.SortOrder=Enum.SortOrder.LayoutOrder; l.Padding=UDim.new(0,g or 0)
+	l.VerticalAlignment=Enum.VerticalAlignment.Top; return l
+end
+local function hl(i,g,ha,va)
+	local l=Instance.new("UIListLayout",i); l.FillDirection=Enum.FillDirection.Horizontal
+	l.SortOrder=Enum.SortOrder.LayoutOrder; l.Padding=UDim.new(0,g or 0)
+	l.HorizontalAlignment=ha or Enum.HorizontalAlignment.Left
+	l.VerticalAlignment=va or Enum.VerticalAlignment.Center; return l
+end
+
+local function frow(parent, fixedH, zi)
+	local f=Instance.new("Frame",parent)
+	if fixedH then f.Size=UDim2.new(1,0,0,fixedH); f.AutomaticSize=Enum.AutomaticSize.None
+	else f.Size=UDim2.new(1,0,0,0); f.AutomaticSize=Enum.AutomaticSize.Y end
+	f.BackgroundTransparency=1; f.BorderSizePixel=0; f.ZIndex=zi or 5; return f
+end
+
+local function fbox(parent, col, fixedH, zi)
+	local f=Instance.new("Frame",parent)
+	if fixedH then f.Size=UDim2.new(1,0,0,fixedH); f.AutomaticSize=Enum.AutomaticSize.None
+	else f.Size=UDim2.new(1,0,0,0); f.AutomaticSize=Enum.AutomaticSize.Y end
+	f.BackgroundColor3=col or CARD; f.BorderSizePixel=0; f.ZIndex=zi or 4; return f
+end
+
+local function mkScroll(parent,size,pos,zi)
+	local s=Instance.new("ScrollingFrame",parent); s.Size=size
+	if pos then s.Position=pos end
+	s.BackgroundTransparency=1; s.BorderSizePixel=0
+	s.ScrollBarThickness=3; s.ScrollBarImageColor3=Color3.fromRGB(55,55,80)
+	s.CanvasSize=UDim2.new(0,0,0,0); s.AutomaticCanvasSize=Enum.AutomaticSize.Y
+	s.ScrollingDirection=Enum.ScrollingDirection.Y; s.ZIndex=zi or 3; return s
+end
+
+local function mkLabel(parent,text,sz,col,bold,zi)
+	local l=Instance.new("TextLabel",parent); l.Size=UDim2.new(1,0,0,sz+2)
+	l.BackgroundTransparency=1; l.Text=text; l.TextColor3=col or WHITE
+	l.Font=bold and Enum.Font.GothamBold or Enum.Font.Gotham; l.TextSize=sz or 11
+	l.TextXAlignment=Enum.TextXAlignment.Left; l.TextYAlignment=Enum.TextYAlignment.Center
+	l.TextTruncate=Enum.TextTruncate.AtEnd; l.BorderSizePixel=0; l.ZIndex=zi or 6; return l
+end
+
+local function mkWrap(parent,text,sz,col,zi)
+	local l=mkLabel(parent,text,sz,col,false,zi)
+	l.TextWrapped=true; l.TextTruncate=Enum.TextTruncate.None
+	l.AutomaticSize=Enum.AutomaticSize.Y; l.Size=UDim2.new(1,0,0,0); return l
+end
+
+local function mkInp(parent,ph,zi)
+	local b=Instance.new("TextBox",parent); b.Size=UDim2.new(1,0,0,34)
+	b.BackgroundColor3=INPBG; b.PlaceholderText=ph or ""; b.PlaceholderColor3=MUT
+	b.Text=""; b.TextColor3=OFF; b.Font=Enum.Font.Code; b.TextSize=11
+	b.ClearTextOnFocus=false; b.TextXAlignment=Enum.TextXAlignment.Left
+	b.BorderSizePixel=0; b.ZIndex=zi or 6; cr(b,7); pd(b,10,0,10,0)
+	local s=sk(b,BDR)
+	b.Focused:Connect(function() TweenService:Create(s,TweenInfo.new(0.12),{Color=BDRHI}):Play() end)
+	b.FocusLost:Connect(function() TweenService:Create(s,TweenInfo.new(0.12),{Color=BDR}):Play() end)
+	return b
+end
+
+local function mkBtn(parent,text,bg,tx,h,zi)
+	local b=Instance.new("TextButton",parent); b.Size=UDim2.new(1,0,0,h or 34)
+	b.BackgroundColor3=bg or WHITE; b.Text=text; b.TextColor3=tx or BG
+	b.Font=Enum.Font.GothamBold; b.TextSize=11; b.BorderSizePixel=0; b.ZIndex=zi or 6; cr(b,8)
+	b.MouseEnter:Connect(function() TweenService:Create(b,TweenInfo.new(0.1),{BackgroundTransparency=0.15}):Play() end)
+	b.MouseLeave:Connect(function() TweenService:Create(b,TweenInfo.new(0.1),{BackgroundTransparency=0}):Play() end)
+	return b
+end
+
+local function mkSBtn(parent,text,bg,tx,w,h,zi)
+	local b=mkBtn(parent,text,bg,tx,h or 28,zi); b.Size=UDim2.new(0,w or 70,0,h or 28); b.TextSize=10; return b
+end
+
+local function mkDot(parent,col,sz,zi)
+	local d=Instance.new("Frame",parent); d.Size=UDim2.new(0,sz or 8,0,sz or 8)
+	d.BackgroundColor3=col or DIM; d.BorderSizePixel=0; d.ZIndex=zi or 6; cr(d,99); return d
+end
+
+local function mkPill(parent,text,bg,tx,zi)
+	local b=Instance.new("TextLabel",parent); b.Size=UDim2.new(0,0,0,18)
+	b.AutomaticSize=Enum.AutomaticSize.X; b.BackgroundColor3=bg or CARD2
+	b.Text="  "..text.."  "; b.TextColor3=tx or DIM; b.Font=Enum.Font.GothamBold
+	b.TextSize=9; b.BorderSizePixel=0; b.ZIndex=zi or 6; cr(b,99); return b
+end
+
+local function mkDiv(parent,zi)
+	local d=Instance.new("Frame",parent); d.Size=UDim2.new(1,0,0,1)
+	d.BackgroundColor3=BDR; d.BorderSizePixel=0; d.ZIndex=zi or 4; return d
+end
+
+local function mkCard(parent,col,zi)
+	local c=fbox(parent,col or CARD,nil,zi or 5); cr(c,10); sk(c,BDR); return c
+end
+
+local function clearKids(inst)
+	for _,c in pairs(inst:GetChildren()) do
+		if not (c:IsA("UIListLayout") or c:IsA("UIPadding") or c:IsA("UIStroke") or c:IsA("UICorner") or c:IsA("UIGridLayout")) then
+			c:Destroy()
+		end
+	end
+end
+
+local function spacer(parent,w,zi)
+	local f=Instance.new("Frame",parent); f.Size=UDim2.new(0,w,1,0)
+	f.BackgroundTransparency=1; f.BorderSizePixel=0; f.ZIndex=zi or 5; return f
+end
+
+------------------------------------------------------------------------
+-- SCREEN
+------------------------------------------------------------------------
+local W = 540
+
+local screen=Instance.new("ScreenGui")
+screen.Name="UFBarstoolJerseys"; screen.ResetOnSpawn=false
+screen.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; screen.Parent=PlayerGui
+
+local win=Instance.new("Frame",screen)
+win.Size=UDim2.new(0,W,0,650); win.Position=UDim2.new(0.5,-W/2,0.5,-325)
+win.BackgroundColor3=BG; win.BorderSizePixel=0; win.Active=true; win.ClipsDescendants=true
+cr(win,14); sk(win,BDR)
+
+local _d,_ds,_dp
+win.InputBegan:Connect(function(i)
+	if i.UserInputType==Enum.UserInputType.MouseButton1 then
+		_d=true; _ds=i.Position; _dp=win.Position
+		i.Changed:Connect(function() if i.UserInputState==Enum.UserInputState.End then _d=false end end)
+	end
+end)
+win.InputChanged:Connect(function(i)
+	if _d and i.UserInputType==Enum.UserInputType.MouseMovement then
+		local dv=i.Position-_ds
+		win.Position=UDim2.new(_dp.X.Scale,_dp.X.Offset+dv.X,_dp.Y.Scale,_dp.Y.Offset+dv.Y)
+	end
+end)
+
+-- top stripe
+local stripe=Instance.new("Frame",win); stripe.Size=UDim2.new(1,0,0,2)
+stripe.BackgroundColor3=WHITE; stripe.BorderSizePixel=0; stripe.ZIndex=10
+
+-- HEADER
+local hdr=fbox(win,SURF,58,6); hdr.Size=UDim2.new(1,0,0,58)
+local logoBadge=fbox(hdr,WHITE,38,8); logoBadge.Size=UDim2.new(0,38,0,38)
+logoBadge.Position=UDim2.new(0,14,0.5,-19); logoBadge.AutomaticSize=Enum.AutomaticSize.None; cr(logoBadge,9)
+local logoL=Instance.new("TextLabel",logoBadge); logoL.Size=UDim2.new(1,0,1,0)
+logoL.BackgroundTransparency=1; logoL.Text="🏀"; logoL.TextSize=22; logoL.ZIndex=9
+logoL.TextXAlignment=Enum.TextXAlignment.Center; logoL.TextYAlignment=Enum.TextYAlignment.Center
+
+local titleL=Instance.new("TextLabel",hdr); titleL.Size=UDim2.new(0,240,0,22)
+titleL.Position=UDim2.new(0,60,0,9); titleL.BackgroundTransparency=1
+titleL.Text="UFBarstool Jerseys"; titleL.TextColor3=WHITE; titleL.Font=Enum.Font.GothamBold
+titleL.TextSize=16; titleL.TextXAlignment=Enum.TextXAlignment.Left; titleL.ZIndex=7
+
+local subL=Instance.new("TextLabel",hdr); subL.Size=UDim2.new(0,320,0,13)
+subL.Position=UDim2.new(0,60,0,33); subL.BackgroundTransparency=1
+subL.Text="jersey textures  ·  groups  ·  auto‑reapply on spawn"
+subL.TextColor3=MUT; subL.Font=Enum.Font.Gotham; subL.TextSize=10
+subL.TextXAlignment=Enum.TextXAlignment.Left; subL.ZIndex=7
+
+local scanBtn=mkBtn(hdr,"↺  Scan",WHITE,BG,28,8)
+scanBtn.Size=UDim2.new(0,82,0,28); scanBtn.Position=UDim2.new(1,-96,0.5,-14); scanBtn.TextSize=11
+
+-- STATUS BAR
+local statusBar=fbox(win,SURF,26,5); statusBar.Size=UDim2.new(1,0,0,26)
+statusBar.Position=UDim2.new(0,0,0,58); pd(statusBar,16,0,16,0); hl(statusBar,8)
+
+local statusDot=mkDot(statusBar,MUT,6,6)
+local statusTxt=Instance.new("TextLabel",statusBar)
+statusTxt.Size=UDim2.new(1,-130,1,0); statusTxt.BackgroundTransparency=1
+statusTxt.Text="Press ↺ Scan to detect jerseys"; statusTxt.TextColor3=MUT
+statusTxt.Font=Enum.Font.Gotham; statusTxt.TextSize=10
+statusTxt.TextXAlignment=Enum.TextXAlignment.Left; statusTxt.ZIndex=6
+local activePill=mkPill(statusBar,"No group active",CARD2,MUT,6)
+
+local rule1=Instance.new("Frame",win); rule1.Size=UDim2.new(1,0,0,1)
+rule1.Position=UDim2.new(0,0,0,84); rule1.BackgroundColor3=BDR; rule1.BorderSizePixel=0; rule1.ZIndex=4
+
+-- TAB BAR
+local tabBarBg=fbox(win,SURF,38,5); tabBarBg.Size=UDim2.new(1,0,0,38); tabBarBg.Position=UDim2.new(0,0,0,85)
+local tabTrack=fbox(tabBarBg,Color3.fromRGB(10,10,14),28,6)
+tabTrack.Size=UDim2.new(1,-20,0,28); tabTrack.Position=UDim2.new(0,10,0.5,-14)
+tabTrack.AutomaticSize=Enum.AutomaticSize.None; cr(tabTrack,7); sk(tabTrack,BDR); hl(tabTrack,3); pd(tabTrack,3,3,3,3)
+
+local TABS={"Me","Group"}
+local tabBtns,tabScrolls={},{}
+
+for _,name in ipairs(TABS) do
+	local icon=name=="Me" and "👤" or "🏀"
+	local tb=Instance.new("TextButton",tabTrack)
+	tb.Size=UDim2.new(0.5,-2,1,0); tb.BackgroundColor3=Color3.fromRGB(10,10,14)
+	tb.Text=icon.."  "..name; tb.TextColor3=MUT; tb.Font=Enum.Font.GothamBold; tb.TextSize=12
+	tb.BorderSizePixel=0; tb.ZIndex=7; cr(tb,6); tabBtns[name]=tb
+
+	local sc=mkScroll(win,UDim2.new(1,-20,0,474),UDim2.new(0,10,0,132),3)
+	sc.Visible=false; vl(sc,8); pd(sc,0,4,0,16); tabScrolls[name]=sc
+end
+
+local rule2=Instance.new("Frame",win); rule2.Size=UDim2.new(1,0,0,1)
+rule2.Position=UDim2.new(0,0,0,123); rule2.BackgroundColor3=BDR; rule2.BorderSizePixel=0; rule2.ZIndex=4
+
+local currentTab=""
+local function setTab(name)
+	currentTab=name
+	for _,n in ipairs(TABS) do
+		local on=(n==name)
+		TweenService:Create(tabBtns[n],TweenInfo.new(0.13),{
+			BackgroundColor3=on and WHITE or Color3.fromRGB(10,10,14),
+			TextColor3=on and BG or MUT,
+		}):Play()
+		tabScrolls[n].Visible=on
+	end
+end
+for _,n in ipairs(TABS) do
+	tabBtns[n].MouseButton1Click:Connect(function() setTab(n) end)
+end
+
+-- FOOTER
+local rule3=Instance.new("Frame",win); rule3.Size=UDim2.new(1,0,0,1)
+rule3.Position=UDim2.new(0,0,1,-50); rule3.BackgroundColor3=BDR; rule3.BorderSizePixel=0; rule3.ZIndex=4
+
+local footer=fbox(win,SURF,50,5); footer.Size=UDim2.new(1,0,0,50); footer.Position=UDim2.new(0,0,1,-50)
+pd(footer,14,0,14,0); hl(footer,8)
+
+local toastTxt=Instance.new("TextLabel",footer); toastTxt.Size=UDim2.new(1,-165,1,0)
+toastTxt.BackgroundTransparency=1; toastTxt.Text="Ready."
+toastTxt.TextColor3=MUT; toastTxt.Font=Enum.Font.Gotham; toastTxt.TextSize=10
+toastTxt.TextXAlignment=Enum.TextXAlignment.Left; toastTxt.TextYAlignment=Enum.TextYAlignment.Center; toastTxt.ZIndex=6
+
+local pushAllBtn=mkBtn(footer,"▶  Push to Group",WHITE,BG,32,7)
+pushAllBtn.Size=UDim2.new(0,148,0,32)
+
+local function toast(msg,kind)
+	toastTxt.Text=msg
+	toastTxt.TextColor3=kind=="ok" and GRN or kind=="err" and RED or DIM
+end
+
+local function updateStatus()
+	local ag=activeGroup()
+	if ag then
+		activePill.Text="  ⚡ "..ag.name.."  "; activePill.BackgroundColor3=GRNBG; activePill.TextColor3=GRN
+		statusDot.BackgroundColor3=GRN
+	else
+		activePill.Text="  No group active  "; activePill.BackgroundColor3=CARD2; activePill.TextColor3=MUT
+		statusDot.BackgroundColor3=MUT
+	end
+end
+
+------------------------------------------------------------------------
+-- FLASH HELPERS
+------------------------------------------------------------------------
+local function flashOK(b,s,lbl2)
+	b.Text="✓"; TweenService:Create(b,TweenInfo.new(0.14),{BackgroundColor3=GRN,TextColor3=BG}):Play()
+	if s then TweenService:Create(s,TweenInfo.new(0.14),{Color=GRN}):Play() end
+	task.delay(2.2,function()
+		if not(b and b.Parent) then return end
+		TweenService:Create(b,TweenInfo.new(0.25),{BackgroundColor3=WHITE,TextColor3=BG}):Play()
+		if s then TweenService:Create(s,TweenInfo.new(0.25),{Color=BDR}):Play() end
+		b.Text=lbl2 or "Apply"
+	end)
+end
+
+local function flashERR(b,lbl2)
+	b.Text="✗"; TweenService:Create(b,TweenInfo.new(0.14),{BackgroundColor3=RED,TextColor3=WHITE}):Play()
+	task.delay(2,function()
+		if not(b and b.Parent) then return end
+		TweenService:Create(b,TweenInfo.new(0.25),{BackgroundColor3=WHITE,TextColor3=BG}):Play()
+		b.Text=lbl2 or "Apply"
+	end)
+end
+
+------------------------------------------------------------------------
+-- ME TAB
+------------------------------------------------------------------------
+local rebuildMe,rebuildGroup
+
+rebuildMe=function()
+	local sc=tabScrolls["Me"]; clearKids(sc)
+	if #detectedJerseys==0 then
+		local c=mkCard(sc); pd(c,16,14,16,14); vl(c,6)
+		mkLabel(c,"No JERSEY_ accessories found.",13,DIM,true).ZIndex=7
+		mkWrap(c,"Press ↺ Scan to search your character for JERSEY_ accessories.",10,MUT).ZIndex=7
+		return
+	end
+	local info=fbox(sc,SURF); cr(info,10); sk(info,BDR); pd(info,14,10,14,10); hl(info,8)
+	mkDot(info,GRN,7,6)
+	local il=mkLabel(info,#detectedJerseys.." jersey"..(#detectedJerseys==1 and "" or "s").." detected on your character",11,OFF,true,7)
+	il.Size=UDim2.new(1,-18,0,16)
+
+	for _,accName in ipairs(detectedJerseys) do
+		local c=mkCard(sc); pd(c,14,12,14,14); vl(c,10)
+		local cs=c:FindFirstChildOfClass("UIStroke")
+		-- name
+		local nr=frow(c,22); hl(nr,8)
+		mkDot(nr,MUT,6,6)
+		local nl=mkLabel(nr,accName,13,WHITE,true,7); nl.Size=UDim2.new(1,-18,0,22)
+		-- input
+		local ti=mkInp(c,"Paste texture ID  (rbxassetid://… or just the number)",7)
+		-- btn row
+		local br=frow(c,34); hl(br,8)
+		local ab=mkBtn(br,"Apply",WHITE,BG,34,7); ab.Size=UDim2.new(0,90,0,34)
+		ab.MouseButton1Click:Connect(function()
+			local nid=normalizeId(ti.Text)
+			if not nid then toast("Paste a valid texture ID","err"); return end
+			ab.Text="⏳"; ab.BackgroundColor3=CARD2
+			task.spawn(function()
+				local char=player.Character
+				if not char then toast("No character","err"); flashERR(ab); return end
+				local acc=char:FindFirstChild(accName)
+				if not acc then toast(accName.." not on character","err"); flashERR(ab); return end
+				pcall(function() ContentProvider:PreloadAsync({nid}) end)
+				local ok=applyTexture(acc,nid)
+				if ok then flashOK(ab,cs); toast("Applied to "..accName,"ok")
+				else flashERR(ab); toast("Apply failed","err") end
+			end)
+		end)
+	end
+end
+
+------------------------------------------------------------------------
+-- GROUP TAB  — three panels stacked in the scroll:
+--   1. Group selector (create + pill chooser)
+--   2. Jersey texture table (inline edit → auto-push on save)
+--   3. Players panel (server list picker + member roster)
+------------------------------------------------------------------------
+rebuildGroup=function()
+	local sc=tabScrolls["Group"]; clearKids(sc)
+
+	--------------------------------------------------------------------
+	-- PANEL 1 — GROUP SELECTOR
+	--------------------------------------------------------------------
+	local gCard=mkCard(sc); pd(gCard,14,12,14,14); vl(gCard,10)
+
+	-- header row
+	local ghRow=frow(gCard,18); hl(ghRow,8)
+	mkDot(ghRow,WHITE,5,7)
+	mkLabel(ghRow,"GROUPS",9,DIM,true,7).Size=UDim2.new(1,-14,0,18)
+
+	-- create row
+	local createRow=frow(gCard,34); hl(createRow,8)
+	local nameInp=mkInp(createRow,"New group name…",7); nameInp.Size=UDim2.new(1,-110,0,34)
+	local createBtn=mkBtn(createRow,"＋  Create",WHITE,BG,34,7); createBtn.Size=UDim2.new(0,102,0,34)
+
+	createBtn.MouseButton1Click:Connect(function()
+		local name=nameInp.Text:match("^%s*(.-)%s*$")
+		if name=="" then toast("Enter a group name","err"); return end
+		for _,g in ipairs(groups) do if g.name==name then toast("'"..name.."' already exists","err"); return end end
+		table.insert(groups,{name=name,slots={},players={}})
+		nameInp.Text=""; toast("Group '"..name.."' created","ok")
+		rebuildGroup(); updateStatus()
+	end)
+
+	if #groups>0 then
+		local pillRow=frow(gCard); hl(pillRow,6)
+		for gi,grp in ipairs(groups) do
+			local isActive=(activeGroupIdx==gi)
+			local pb=Instance.new("TextButton",pillRow)
+			pb.Size=UDim2.new(0,0,0,28); pb.AutomaticSize=Enum.AutomaticSize.X
+			pb.BackgroundColor3=isActive and WHITE or CARD2
+			pb.Text="  "..(isActive and "⚡ " or "")..grp.name.."  "
+			pb.TextColor3=isActive and BG or DIM; pb.Font=Enum.Font.GothamBold; pb.TextSize=11
+			pb.BorderSizePixel=0; pb.ZIndex=7; cr(pb,99)
+			if not isActive then sk(pb,BDR) end
+			pb.MouseButton1Click:Connect(function()
+				doActivateGroup(gi); toast("'"..grp.name.."' activated","ok")
+				rebuildGroup(); updateStatus()
+			end)
+		end
+		mkWrap(gCard,"Tap a group pill to activate it. Jersey changes below push to all members instantly.",9,MUT).ZIndex=6
+	else
+		mkWrap(gCard,"Create your first group above, then add jersey textures and players below.",10,MUT).ZIndex=6
+	end
+
+	local ag=activeGroup()
+	if not ag then
+		local nc=mkCard(sc); pd(nc,16,14,16,14); vl(nc,5)
+		mkLabel(nc,"No group active",12,DIM,true).ZIndex=7
+		mkWrap(nc,"Create a group and tap it to activate. Then set jersey textures below — they auto-push to all group members.",10,MUT).ZIndex=7
+		return
+	end
+
+	--------------------------------------------------------------------
+	-- PANEL 2 — JERSEY TEXTURE TABLE (inline editable)
+	--------------------------------------------------------------------
+	local jCard=mkCard(sc); pd(jCard,14,12,14,14); vl(jCard,10)
+
+	-- section header
+	local jhRow=frow(jCard,24); hl(jhRow,8)
+	mkDot(jhRow,GRN,8,7)
+	local jhl=mkLabel(jhRow,ag.name.."  ·  Jersey Textures",12,GRN,true,7); jhl.Size=UDim2.new(1,-130,0,24)
+	local pushAllSmall=mkSBtn(jhRow,"▶ Push All",CARD2,DIM,100,26,7); sk(pushAllSmall,BDR)
+	pushAllSmall.MouseButton1Click:Connect(function() pushToAll(); toast("Pushed all jerseys to group","ok") end)
+
+	if #detectedJerseys==0 then
+		mkLabel(jCard,"No jerseys detected — press ↺ Scan first.",11,DIM).ZIndex=7
+	else
+		-- Column headers
+		local colHdr=frow(jCard,18); hl(colHdr,0); pd(colHdr,2,0,2,0)
+		local ch1=mkLabel(colHdr,"JERSEY",8,MUT,true,7); ch1.Size=UDim2.new(0.42,0,1,0)
+		local ch2=mkLabel(colHdr,"TEXTURE ID",8,MUT,true,7); ch2.Size=UDim2.new(1,-0.42*W+0,1,0)
+
+		-- one editable row per detected jersey
+		local tableBox=fbox(jCard,Color3.fromRGB(11,11,17)); tableBox.AutomaticSize=Enum.AutomaticSize.Y
+		cr(tableBox,8); sk(tableBox,BDR); pd(tableBox,0,4,0,4); vl(tableBox,0)
+
+		for ri,accName in ipairs(detectedJerseys) do
+			if ri>1 then mkDiv(tableBox) end
+
+			local savedTex=ag.slots[accName]
+			local rRow=fbox(tableBox,Color3.fromRGB(11,11,17),50); rRow.AutomaticSize=Enum.AutomaticSize.None
+			pd(rRow,10,0,8,0); hl(rRow,0)
+
+			-- jersey name cell
+			local nameCell=frow(rRow,50); nameCell.Size=UDim2.new(0.38,0,1,0)
+			nameCell.AutomaticSize=Enum.AutomaticSize.None; hl(nameCell,7)
+			mkDot(nameCell,savedTex and GRN or MUT,6,7)
+			local nl=mkLabel(nameCell,accName,11,savedTex and OFF or DIM,savedTex,7)
+			nl.Size=UDim2.new(1,-16,1,0)
+
+			-- texture input cell (fills remaining width)
+			local texCell=frow(rRow,50); texCell.Size=UDim2.new(0.62,-80,1,0)
+			texCell.AutomaticSize=Enum.AutomaticSize.None; hl(texCell,0)
+			local ti2=Instance.new("TextBox",texCell)
+			ti2.Size=UDim2.new(1,0,0,34); ti2.BackgroundColor3=INPBG
+			ti2.PlaceholderText=savedTex or "Paste texture ID…"
+			ti2.PlaceholderColor3=savedTex and Color3.fromRGB(55,70,55) or MUT
+			ti2.Text=savedTex or ""; ti2.TextColor3=savedTex and GRNhi or OFF
+			ti2.Font=Enum.Font.Code; ti2.TextSize=10; ti2.ClearTextOnFocus=false
+			ti2.TextXAlignment=Enum.TextXAlignment.Left; ti2.BorderSizePixel=0; ti2.ZIndex=7
+			cr(ti2,6); pd(ti2,8,0,8,0); sk(ti2,BDR)
+			ti2.Focused:Connect(function() TweenService:Create(ti2:FindFirstChildOfClass("UIStroke"),TweenInfo.new(0.12),{Color=BDRHI}):Play() end)
+			ti2.FocusLost:Connect(function() TweenService:Create(ti2:FindFirstChildOfClass("UIStroke"),TweenInfo.new(0.12),{Color=BDR}):Play() end)
+
+			-- save button
+			local saveCell=frow(rRow,50); saveCell.Size=UDim2.new(0,72,1,0)
+			saveCell.AutomaticSize=Enum.AutomaticSize.None; pd(saveCell,6,0,0,0); hl(saveCell,0)
+			local saveBtn=mkBtn(saveCell,"Save",WHITE,BG,28,7); saveBtn.Size=UDim2.new(1,0,0,28)
+			local saveSk=saveBtn:FindFirstChildOfClass("UIStroke") or sk(saveBtn,BDR,0)
+
+			saveBtn.MouseButton1Click:Connect(function()
+				local nid=normalizeId(ti2.Text)
+				if not nid then
+					-- also accept current text as-is if it looks like an ID
+					nid=ti2.Text:match("^%s*(.-)%s*$")
+					nid=normalizeId(nid)
+				end
+				if not nid then toast("Invalid texture ID","err"); return end
+				saveBtn.Text="⏳"; saveBtn.BackgroundColor3=CARD2
+				task.spawn(function()
+					ag.slots[accName]=nid
+					pcall(function() ContentProvider:PreloadAsync({nid}) end)
+					local pushed=0
+					for _,username in ipairs(ag.players) do
+						for _,rp in ipairs(Players:GetPlayers()) do
+							if rp.Name:lower()==username:lower() then
+								local char=rp.Character
+								if char then
+									local acc=char:FindFirstChild(accName)
+									if acc then applyTexture(acc,nid); pushed+=1 end
+								end
+							end
+						end
+					end
+					-- update cell visually
+					ti2.Text=nid; ti2.TextColor3=GRNhi
+					ti2.PlaceholderText=nid; ti2.PlaceholderColor3=Color3.fromRGB(55,70,55)
+					nl.TextColor3=OFF; nl.Font=Enum.Font.GothamBold
+					mkDot(nameCell,GRN,6,7)  -- note: adds extra dot, acceptable
+					flashOK(saveBtn,nil,"Save")
+					local msg="Saved"
+					if pushed>0 then msg=msg.."  ·  pushed to "..pushed.." player"..(pushed==1 and "" or "s") end
+					toast(msg,"ok")
+				end)
+			end)
+
+			-- copy button (if saved)
+			if savedTex then
+				local cpCell=frow(rRow,50); cpCell.Size=UDim2.new(0,0,1,0); cpCell.AutomaticSize=Enum.AutomaticSize.None
+				-- invisible spacer push to right — not needed as hl left aligns; just add copy after save
+			end
+		end
+	end
+
+	--------------------------------------------------------------------
+	-- PANEL 3 — PLAYERS
+	--------------------------------------------------------------------
+	local plrCard=mkCard(sc); pd(plrCard,14,12,14,14); vl(plrCard,10)
+
+	-- header
+	local plrHdrRow=frow(plrCard,20); hl(plrHdrRow,8)
+	mkDot(plrHdrRow,WHITE,5,7)
+	local plrHL=mkLabel(plrHdrRow,"PLAYERS  —  "..ag.name,9,DIM,true,7); plrHL.Size=UDim2.new(1,-120,0,20)
+	local onlineCnt=0
+	for _,u in ipairs(ag.players) do
+		for _,rp in ipairs(Players:GetPlayers()) do if rp.Name:lower()==u:lower() then onlineCnt+=1; break end end
+	end
+	if #ag.players>0 then
+		mkPill(plrHdrRow,onlineCnt.."/"..#ag.players.." online",onlineCnt>0 and GRNBG or CARD2,onlineCnt>0 and GRN or MUT,7)
+	end
+
+	-- ADD FROM SERVER LIST
+	local serverListHdr=frow(plrCard,16); hl(serverListHdr,6)
+	mkDot(serverListHdr,AMBER,5,7)
+	mkLabel(serverListHdr,"Add from server",9,Color3.fromRGB(200,160,50),true,7).Size=UDim2.new(1,-14,0,16)
+
+	-- live server player list (tap to add)
+	local serverPlayers=Players:GetPlayers()
+	if #serverPlayers>0 then
+		local serverBox=fbox(plrCard,Color3.fromRGB(11,11,17)); serverBox.AutomaticSize=Enum.AutomaticSize.Y
+		cr(serverBox,8); sk(serverBox,BDR); pd(serverBox,0,4,0,4); vl(serverBox,0)
+
+		for si,rp in ipairs(serverPlayers) do
+			if si>1 then mkDiv(serverBox) end
+			local alreadyIn=false
+			for _,u in ipairs(ag.players) do if u:lower()==rp.Name:lower() then alreadyIn=true; break end end
+
+			local sRow=fbox(serverBox,Color3.fromRGB(11,11,17),40)
+			sRow.AutomaticSize=Enum.AutomaticSize.None; pd(sRow,10,0,8,0); hl(sRow,0)
+
+			-- green dot (all are online by definition)
+			local sd=mkDot(sRow,GRN,7,7); sd.LayoutOrder=1
+			spacer(sRow,8,7).LayoutOrder=2
+
+			local snl=Instance.new("TextLabel",sRow)
+			snl.Size=UDim2.new(1,-150,1,0); snl.BackgroundTransparency=1
+			snl.Text=rp.Name; snl.TextColor3=alreadyIn and DIM or Color3.fromRGB(185,245,200)
+			snl.Font=alreadyIn and Enum.Font.Gotham or Enum.Font.GothamBold; snl.TextSize=12
+			snl.TextXAlignment=Enum.TextXAlignment.Left; snl.TextTruncate=Enum.TextTruncate.AtEnd
+			snl.ZIndex=7; snl.LayoutOrder=3
+
+			if alreadyIn then
+				local inPill=mkPill(sRow,"Already in group",CARD2,MUT,7); inPill.LayoutOrder=4
+			else
+				local addBtn=mkSBtn(sRow,"＋  Add",WHITE,BG,88,26,7); addBtn.LayoutOrder=4
+				addBtn.MouseButton1Click:Connect(function()
+					for _,u in ipairs(ag.players) do if u:lower()==rp.Name:lower() then toast(rp.Name.." already in group","err"); return end end
+					table.insert(ag.players,rp.Name)
+					pushToChar(rp)
+					toast("Added "..rp.Name.." to "..ag.name,"ok")
+					rebuildGroup(); updateStatus()
+				end)
+			end
+		end
+	else
+		mkLabel(plrCard,"No other players in server — use manual add below.",10,MUT).ZIndex=7
+	end
+
+	-- MANUAL ADD
+	local manHdr=frow(plrCard,16); hl(manHdr,6)
+	mkDot(manHdr,WHITE,5,7)
+	mkLabel(manHdr,"Manual add  (not in server)",9,DIM,true,7).Size=UDim2.new(1,-14,0,16)
+
+	local manRow=frow(plrCard,34); hl(manRow,8)
+	local manInp=mkInp(manRow,"Roblox username (exact spelling)",7); manInp.Size=UDim2.new(1,-114,0,34)
+	local manBtn=mkBtn(manRow,"＋  Add",WHITE,BG,34,7); manBtn.Size=UDim2.new(0,106,0,34)
+
+	manBtn.MouseButton1Click:Connect(function()
+		local username=manInp.Text:match("^%s*(.-)%s*$")
+		if username=="" then toast("Enter a Roblox username","err"); return end
+		for _,u in ipairs(ag.players) do if u:lower()==username:lower() then toast(username.." already in group","err"); return end end
+		table.insert(ag.players,username)
+		manInp.Text=""
+		for _,rp in ipairs(Players:GetPlayers()) do if rp.Name:lower()==username:lower() then pushToChar(rp); break end end
+		toast("Added "..username.." to "..ag.name,"ok")
+		rebuildGroup(); updateStatus()
+	end)
+
+	-- MEMBER ROSTER
+	if #ag.players>0 then
+		local rosterHdr=frow(plrCard,16); hl(rosterHdr,6)
+		mkDot(rosterHdr,WHITE,5,7)
+		mkLabel(rosterHdr,"Members  ("..#ag.players..")",9,DIM,true,7).Size=UDim2.new(1,-14,0,16)
+
+		local rosterBox=fbox(plrCard,Color3.fromRGB(11,11,17)); rosterBox.AutomaticSize=Enum.AutomaticSize.Y
+		cr(rosterBox,8); sk(rosterBox,BDR); pd(rosterBox,0,4,0,4); vl(rosterBox,0)
+
+		for pi,username in ipairs(ag.players) do
+			if pi>1 then mkDiv(rosterBox) end
+			local isOnline,onlineRp=false,nil
+			for _,rp in ipairs(Players:GetPlayers()) do if rp.Name:lower()==username:lower() then isOnline=true; onlineRp=rp; break end end
+
+			local pRow=fbox(rosterBox,Color3.fromRGB(11,11,17),44)
+			pRow.AutomaticSize=Enum.AutomaticSize.None; pd(pRow,10,0,8,0); hl(pRow,0)
+
+			mkDot(pRow,isOnline and GRN or MUT,7,7).LayoutOrder=1
+			spacer(pRow,8,7).LayoutOrder=2
+
+			local uTxt=Instance.new("TextLabel",pRow)
+			uTxt.Size=UDim2.new(1,-196,1,0); uTxt.BackgroundTransparency=1
+			uTxt.Text=username; uTxt.TextColor3=isOnline and Color3.fromRGB(185,245,200) or Color3.fromRGB(145,145,165)
+			uTxt.Font=isOnline and Enum.Font.GothamBold or Enum.Font.Gotham; uTxt.TextSize=12
+			uTxt.TextXAlignment=Enum.TextXAlignment.Left; uTxt.TextTruncate=Enum.TextTruncate.AtEnd
+			uTxt.ZIndex=7; uTxt.LayoutOrder=3
+
+			if isOnline then
+				local ob=mkPill(pRow,"Online",GRNBG,GRN,7); ob.LayoutOrder=4
+				spacer(pRow,6,7).LayoutOrder=5
+			end
+
+			local pushBtn=mkSBtn(pRow,"▶ Push",CARD2,DIM,68,26,7); sk(pushBtn,BDR); pushBtn.LayoutOrder=6
+			pushBtn.MouseButton1Click:Connect(function()
+				if not isOnline then toast(username.." not in server","err"); return end
+				pushToChar(onlineRp); toast("Pushed to "..username,"ok")
+			end)
+			spacer(pRow,6,7).LayoutOrder=7
+
+			local remBtn=mkSBtn(pRow,"✕",REDBG,RED,28,26,7); sk(remBtn,Color3.fromRGB(55,18,18)); remBtn.LayoutOrder=8
+			remBtn.MouseButton1Click:Connect(function()
+				table.remove(ag.players,pi); toast("Removed "..username,"err"); rebuildGroup(); updateStatus()
+			end)
+		end
+	else
+		mkWrap(plrCard,"No players in this group yet. Add from the server list above or manually.",10,MUT).ZIndex=7
+	end
+
+	-- DELETE GROUP
+	local delRow=frow(sc,30); hl(delRow,0,Enum.HorizontalAlignment.Right)
+	local delBtn=mkSBtn(delRow,"✕  Delete  '"..ag.name.."'",REDBG,RED,190,28,6); sk(delBtn,Color3.fromRGB(55,18,18))
+	delBtn.MouseButton1Click:Connect(function()
+		local name=ag.name; table.remove(groups,activeGroupIdx)
+		activeGroupIdx=#groups>0 and 1 or nil
+		if activeGroupIdx then doActivateGroup(activeGroupIdx) end
+		toast("Deleted '"..name.."'","err"); rebuildGroup(); updateStatus()
+	end)
+end
+
+------------------------------------------------------------------------
+-- SCAN
+------------------------------------------------------------------------
+local function scanJerseys()
+	local char=player.Character; detectedJerseys={}
+	if not char then toast("No character found","err"); return end
+	for _,child in ipairs(char:GetChildren()) do
+		if child:IsA("Accessory") and child.Name:sub(1,7)=="JERSEY_" then
+			table.insert(detectedJerseys,child.Name)
+		end
+	end
+	table.sort(detectedJerseys)
+	local n=#detectedJerseys
+	statusTxt.Text=n.." jersey"..(n==1 and "" or "s").." found"
+	statusDot.BackgroundColor3=n>0 and GRN or MUT
+	toast(n.." jersey"..(n==1 and "" or "s").." found",n>0 and "ok" or nil)
+	rebuildMe(); rebuildGroup()
+end
+
+------------------------------------------------------------------------
+-- WIRE UP
+------------------------------------------------------------------------
+scanBtn.MouseButton1Click:Connect(scanJerseys)
+
+pushAllBtn.MouseButton1Click:Connect(function()
+	if not activeGroupIdx then toast("No active group","err"); return end
+	pushToAll(); toast("Pushed all jerseys to group members","ok")
+end)
+
+tabBtns["Group"].MouseButton1Click:Connect(function() setTab("Group"); rebuildGroup(); updateStatus() end)
+tabBtns["Me"].MouseButton1Click:Connect(function() setTab("Me"); rebuildMe() end)
+
+player.CharacterAdded:Connect(function()
+	task.wait(0.7); scanJerseys()
+	if activeGroupIdx then
+		for _,rp in ipairs(Players:GetPlayers()) do
+			if rp.Name==player.Name then pushToChar(rp); break end
+		end
+	end
+end)
+
+if player.Character then scanJerseys() end
+rebuildMe(); rebuildGroup(); updateStatus()
+setTab("Me")

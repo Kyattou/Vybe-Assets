@@ -1,0 +1,1602 @@
+--[[
+	ACCESSORY EDITOR v4
+	Tabs: Textures · Mesh Swap · Full Replace · Inspector · Live Feed
+	
+	Core philosophy:
+	  - Never write directly to server-owned parts (goes black / ignored)
+	  - For texture/mesh changes: clone the Handle, modify clone, swap it in
+	  - For full replace: InsertService:LoadAsset → extract Accessory → weld in
+	  - Live feed: GetPropertyChangedSignal + ChildAdded on every desc
+--]]
+
+local Players        = game:GetService("Players")
+local InsertService  = game:GetService("InsertService")
+local TweenService   = game:GetService("TweenService")
+local ContentProvider= game:GetService("ContentProvider")
+
+local player    = Players.LocalPlayer
+local PlayerGui = player:WaitForChild("PlayerGui")
+
+if PlayerGui:FindFirstChild("AccessoryEditor") then
+	PlayerGui.AccessoryEditor:Destroy()
+end
+
+-- =============================================
+-- UTILS
+-- =============================================
+local function normalizeId(raw)
+	if not raw or raw == "" or raw == "(none)" then return nil end
+	if raw:match("^rbxassetid://%d+$") then return raw end
+	local n = raw:match("rbxassetid://(%d+)") or raw:match("[?&]id=(%d+)") or raw:match("^%s*(%d+)%s*$")
+	return n and ("rbxassetid://"..n) or nil
+end
+
+local function numId(raw)
+	if not raw then return nil end
+	return raw:match("rbxassetid://(%d+)") or raw:match("^%s*(%d+)%s*$")
+end
+
+local function v3s(v)  return string.format("%.2f, %.2f, %.2f",v.X,v.Y,v.Z) end
+local function cfs(c)  local p=c.Position local x,y,z=c:ToEulerAnglesXYZ() return string.format("P(%.1f,%.1f,%.1f) R(%.0f,%.0f,%.0f)",p.X,p.Y,p.Z,math.deg(x),math.deg(y),math.deg(z)) end
+local function cols(c) return string.format("RGB(%d,%d,%d)",math.round(c.R*255),math.round(c.G*255),math.round(c.B*255)) end
+local function enums(e) local s=tostring(e) return s:match("%.([^%.]+)$") or s end
+
+-- =============================================
+-- HANDLE CLONE-SWAP (core engine)
+-- Clone the Handle, apply changes on the clone
+-- (client-owned), destroy original, parent clone.
+-- This is the ONLY reliable way to change visual
+-- properties that are server-replicated.
+-- =============================================
+local function cloneSwapHandle(accessory, mutateFn)
+	local handle = accessory:FindFirstChild("Handle")
+	if not handle then return false, "No Handle" end
+
+	local newHandle = handle:Clone()
+	local ok, err = pcall(mutateFn, newHandle)
+	if not ok then
+		newHandle:Destroy()
+		return false, tostring(err)
+	end
+
+	local savedCF = handle.CFrame
+	newHandle.Anchored = false
+	handle:Destroy()
+	newHandle.Parent = accessory
+	newHandle.CFrame = savedCF
+
+	-- Re-weld to body
+	local char = accessory.Parent
+	if char then
+		local firstAtt = newHandle:FindFirstChildOfClass("Attachment")
+		if firstAtt then
+			for _, desc in ipairs(char:GetDescendants()) do
+				if desc:IsA("Attachment") and desc.Name == firstAtt.Name and desc.Parent ~= newHandle then
+					local bp = desc.Parent
+					if bp and bp:IsA("BasePart") then
+						local isAcc = false
+						pcall(function() isAcc = bp.Parent:IsA("Accessory") end)
+						if not isAcc then
+							newHandle.CFrame = desc.WorldCFrame * firstAtt.CFrame:Inverse()
+							local wc = Instance.new("WeldConstraint")
+							wc.Part0 = newHandle; wc.Part1 = bp; wc.Parent = newHandle
+							break
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return true, newHandle
+end
+
+-- =============================================
+-- DEEP SCAN — returns slot list for an accessory
+-- =============================================
+local function deepScan(accessory)
+	local slots = {}
+	local handle = accessory:FindFirstChild("Handle")
+	if not handle then return slots end
+
+	if handle:IsA("MeshPart") then
+		table.insert(slots, {
+			label = "MeshPart · TextureID",
+			kind  = "texture",
+			prop  = "TextureID",
+			id    = normalizeId(handle.TextureID) or "(none)",
+			meshId= normalizeId(handle.MeshId)    or "(none)",
+		})
+	end
+
+	local sm = handle:FindFirstChildOfClass("SpecialMesh")
+	if sm then
+		table.insert(slots, {
+			label = "SpecialMesh · TextureId",
+			kind  = "texture",
+			prop  = "TextureId",
+			smName= sm.Name,
+			id    = normalizeId(sm.TextureId) or "(none)",
+			meshId= normalizeId(sm.MeshId)    or "(none)",
+		})
+	end
+
+	for _, c in ipairs(handle:GetChildren()) do
+		if c:IsA("Decal") then
+			table.insert(slots, {
+				label   = "Decal · "..c.Name.." · "..enums(c.Face),
+				kind    = "decal",
+				prop    = "Texture",
+				childName = c.Name,
+				childClass= "Decal",
+				face    = tostring(c.Face),
+				id      = normalizeId(c.Texture) or "(none)",
+			})
+		elseif c:IsA("Texture") then
+			table.insert(slots, {
+				label   = "Texture · "..c.Name.." · "..enums(c.Face),
+				kind    = "decal",
+				prop    = "Texture",
+				childName = c.Name,
+				childClass= "Texture",
+				face    = tostring(c.Face),
+				id      = normalizeId(c.Texture) or "(none)",
+			})
+		end
+	end
+
+	local sa = handle:FindFirstChildOfClass("SurfaceAppearance")
+	if sa then
+		for _, mp in ipairs({"ColorMap","NormalMap","RoughnessMap","MetalnessMap"}) do
+			table.insert(slots, {
+				label = "SurfaceAppearance · "..mp,
+				kind  = "sa",
+				prop  = mp,
+				id    = normalizeId(sa[mp]) or "(none)",
+			})
+		end
+	end
+
+	return slots
+end
+
+-- =============================================
+-- APPLY TEXTURE via clone-swap
+-- =============================================
+local function applyTextureToSlot(accessory, slot, normId)
+	return cloneSwapHandle(accessory, function(h)
+		if slot.prop == "TextureID" then
+			h.TextureID = normId
+
+		elseif slot.prop == "TextureId" then
+			local sm = h:FindFirstChildOfClass("SpecialMesh")
+			if not sm then error("No SpecialMesh") end
+			sm.TextureId = normId
+
+		elseif slot.kind == "decal" then
+			for _, c in ipairs(h:GetChildren()) do
+				if c.ClassName == slot.childClass and c.Name == slot.childName then
+					c.Texture = normId; break
+				end
+			end
+
+		elseif slot.kind == "sa" then
+			local sa = h:FindFirstChildOfClass("SurfaceAppearance")
+			if not sa then error("No SurfaceAppearance") end
+			sa[slot.prop] = normId
+		end
+	end)
+end
+
+-- =============================================
+-- APPLY MESH via clone-swap
+-- Supports: MeshPart.MeshId (via SpecialMesh swap),
+--           SpecialMesh.MeshId, full model asset insert
+-- =============================================
+local function applyMeshToHandle(accessory, meshAssetId, keepTexture)
+	-- Strategy: load the asset, find a Part/MeshPart/Accessory inside,
+	-- extract geometry, and build a new Handle from it.
+	local nId = numId(meshAssetId)
+	if not nId then return false, "Invalid mesh asset ID" end
+
+	local ok, model = pcall(function()
+		return InsertService:LoadAsset(tonumber(nId))
+	end)
+	if not ok or not model then
+		return false, "LoadAsset failed — asset private or invalid"
+	end
+
+	-- Find the best part to use as the new mesh source
+	local srcPart = nil
+	-- Prefer Accessory Handle
+	local srcAcc = model:FindFirstChildOfClass("Accessory") or model:FindFirstChildOfClass("Hat")
+	if srcAcc then
+		srcPart = srcAcc:FindFirstChild("Handle")
+	end
+	-- Fallback: first MeshPart or Part with SpecialMesh
+	if not srcPart then
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("MeshPart") or (d:IsA("Part") and d:FindFirstChildOfClass("SpecialMesh")) then
+				srcPart = d; break
+			end
+		end
+	end
+	-- Fallback: first BasePart at all
+	if not srcPart then
+		srcPart = model:FindFirstChildOfClass("BasePart")
+		if not srcPart then
+			for _, d in ipairs(model:GetDescendants()) do
+				if d:IsA("BasePart") then srcPart = d; break end
+			end
+		end
+	end
+
+	if not srcPart then
+		model:Destroy()
+		return false, "No usable Part found in asset "..nId
+	end
+
+	local handle = accessory:FindFirstChild("Handle")
+	if not handle then model:Destroy(); return false, "Accessory has no Handle" end
+
+	-- Save current texture if keepTexture
+	local savedTex = ""
+	if keepTexture then
+		if handle:IsA("MeshPart") then savedTex = handle.TextureID
+		else
+			local sm = handle:FindFirstChildOfClass("SpecialMesh")
+			if sm then savedTex = sm.TextureId end
+		end
+	end
+
+	local ok2, result = cloneSwapHandle(accessory, function(h)
+		if srcPart:IsA("MeshPart") then
+			-- If source is MeshPart, swap the MeshId and TextureID on the clone
+			-- We have to use a SpecialMesh because MeshPart.MeshId is read-only
+			-- Remove existing mesh children
+			for _, c in ipairs(h:GetChildren()) do
+				if c:IsA("SpecialMesh") then c:Destroy() end
+			end
+			local sm2 = Instance.new("SpecialMesh")
+			sm2.MeshType = Enum.MeshType.FileMesh
+			sm2.MeshId   = srcPart.MeshId ~= "" and srcPart.MeshId or ("rbxassetid://"..nId)
+			sm2.TextureId= keepTexture and savedTex or (srcPart.TextureID ~= "" and srcPart.TextureID or "")
+			sm2.Scale    = Vector3.new(1,1,1)
+			sm2.Parent   = h
+
+			-- Copy size
+			h.Size = srcPart.Size
+
+		else
+			-- Source is a regular Part with SpecialMesh
+			local srcSM = srcPart:FindFirstChildOfClass("SpecialMesh")
+			for _, c in ipairs(h:GetChildren()) do
+				if c:IsA("SpecialMesh") then c:Destroy() end
+			end
+			if srcSM then
+				local newSM = srcSM:Clone()
+				if keepTexture and savedTex ~= "" then
+					newSM.TextureId = savedTex
+				end
+				newSM.Parent = h
+			end
+			h.Size = srcPart.Size
+		end
+	end)
+
+	model:Destroy()
+	return ok2, result
+end
+
+-- =============================================
+-- FULL ACCESSORY REPLACE (InsertService)
+-- =============================================
+local function snapAccessory(acc)
+	local s = {name=acc.Name}
+	pcall(function() s.accType = acc.AccessoryType end)
+	local h = acc:FindFirstChild("Handle")
+	if not h then return s end
+	s.size=h.Size; s.cf=h.CFrame; s.massless=h.Massless
+	s.canCollide=h.CanCollide; s.castShadow=h.CastShadow
+	s.atts={}
+	for _,c in ipairs(h:GetChildren()) do
+		if c:IsA("Attachment") then table.insert(s.atts,{name=c.Name,cf=c.CFrame}) end
+	end
+	return s
+end
+
+local function findBodyPart(char, attName)
+	if not attName then return char:FindFirstChild("HumanoidRootPart"), nil end
+	for _,d in ipairs(char:GetDescendants()) do
+		if d:IsA("Attachment") and d.Name==attName then
+			local p=d.Parent
+			if p and p:IsA("BasePart") then
+				local ia=false; pcall(function() ia=p.Parent:IsA("Accessory") end)
+				if not ia then return p,d end
+			end
+		end
+	end
+	return char:FindFirstChild("HumanoidRootPart"),nil
+end
+
+local function fullReplace(accName, normId, onDone)
+	local char = player.Character
+	if not char then onDone(false,"No character") return end
+	local orig = char:FindFirstChild(accName)
+	if not orig or not orig:IsA("Accessory") then onDone(false,"Not found — rescan") return end
+	local snap = snapAccessory(orig)
+	local nid  = numId(normId)
+	if not nid then onDone(false,"Bad ID") return end
+	task.spawn(function()
+		local ok,mdl = pcall(function() return InsertService:LoadAsset(tonumber(nid)) end)
+		if not ok or not mdl then onDone(false,"LoadAsset failed") return end
+		local newAcc = mdl:FindFirstChildOfClass("Accessory") or mdl:FindFirstChildOfClass("Hat")
+		if not newAcc then
+			for _,d in ipairs(mdl:GetDescendants()) do
+				if d:IsA("Accessory") or d:IsA("Hat") then newAcc=d break end
+			end
+		end
+		if not newAcc then mdl:Destroy(); onDone(false,"No Accessory in asset") return end
+		newAcc = newAcc:Clone(); mdl:Destroy()
+		local nh = newAcc:FindFirstChild("Handle")
+		if not nh then onDone(false,"No Handle in new acc") return end
+		pcall(function() nh.Size=snap.size end)
+		pcall(function() nh.Massless=snap.massless end)
+		pcall(function() nh.CanCollide=snap.canCollide end)
+		pcall(function() nh.CastShadow=snap.castShadow end)
+		for _,a in ipairs(snap.atts) do
+			local na=nh:FindFirstChild(a.name)
+			if na and na:IsA("Attachment") then pcall(function() na.CFrame=a.cf end)
+			else local att=Instance.new("Attachment"); att.Name=a.name; att.CFrame=a.cf; att.Parent=nh end
+		end
+		if snap.accType then pcall(function() newAcc.AccessoryType=snap.accType end) end
+		newAcc.Name=snap.name
+		pcall(function() nh.CFrame=snap.cf end)
+		orig:Destroy(); newAcc.Parent=char
+		task.wait()
+		local hasW=false
+		for _,c in ipairs(nh:GetChildren()) do
+			if c:IsA("Weld") or c:IsA("WeldConstraint") then hasW=true break end
+		end
+		if not hasW and #snap.atts>0 then
+			local bp,ba = findBodyPart(char, snap.atts[1].name)
+			if bp then
+				if ba then pcall(function() nh.CFrame=ba.WorldCFrame*snap.atts[1].cf:Inverse() end) end
+				local wc=Instance.new("WeldConstraint"); wc.Part0=nh; wc.Part1=bp; wc.Parent=nh
+			end
+		end
+		onDone(true,newAcc)
+	end)
+end
+
+-- =============================================
+-- INSPECTOR DATA
+-- =============================================
+local function inspectAccessory(acc)
+	local d={} local h=acc:FindFirstChild("Handle")
+	d["Accessory"]={Name=acc.Name,ClassName=acc.ClassName}
+	pcall(function() d["Accessory"].AccessoryType=enums(acc.AccessoryType) end)
+	if not h then d["Handle"]={Error="No Handle"} return d end
+	d["Handle"]={ClassName=h.ClassName,Size=v3s(h.Size),CFrame=cfs(h.CFrame),
+		Color=cols(h.Color),Material=enums(h.Material),
+		Transparency=tostring(h.Transparency),Reflectance=tostring(h.Reflectance),
+		Anchored=tostring(h.Anchored),CanCollide=tostring(h.CanCollide),
+		Massless=tostring(h.Massless),CastShadow=tostring(h.CastShadow)}
+	if h:IsA("MeshPart") then
+		d["Handle"].MeshId=h.MeshId~="" and h.MeshId or "(none)"
+		d["Handle"].TextureID=h.TextureID~="" and h.TextureID or "(none)"
+		d["Handle"].MeshSize=v3s(h.MeshSize)
+		d["Handle"].RenderFidelity=enums(h.RenderFidelity)
+	end
+	local sm=h:FindFirstChildOfClass("SpecialMesh")
+	if sm then d["SpecialMesh"]={MeshType=enums(sm.MeshType),MeshId=sm.MeshId~="" and sm.MeshId or "(none)",TextureId=sm.TextureId~="" and sm.TextureId or "(none)",Scale=v3s(sm.Scale),Offset=v3s(sm.Offset)} end
+	local di,ti=1,1
+	for _,c in ipairs(h:GetChildren()) do
+		if c:IsA("Decal") then d["Decal#"..di.."_"..c.Name]={Texture=c.Texture~="" and c.Texture or "(none)",Face=enums(c.Face),Transparency=tostring(c.Transparency)} di+=1
+		elseif c:IsA("Texture") then d["Texture#"..ti.."_"..c.Name]={Texture=c.Texture~="" and c.Texture or "(none)",Face=enums(c.Face),StudsU=tostring(c.StudsPerTileU),StudsV=tostring(c.StudsPerTileV)} ti+=1 end
+	end
+	local ai,wi=1,1
+	for _,c in ipairs(h:GetChildren()) do
+		if c:IsA("Attachment") then d["Attachment#"..ai]={Name=c.Name,CFrame=cfs(c.CFrame)} ai+=1
+		elseif c:IsA("WeldConstraint") or c:IsA("Weld") then
+			local w={Name=c.Name,Enabled=tostring(c.Enabled)}
+			pcall(function() w.Part0=c.Part0 and c.Part0.Name or "nil"; w.Part1=c.Part1 and c.Part1.Name or "nil" end)
+			if c:IsA("Weld") then w.C0=cfs(c.C0); w.C1=cfs(c.C1) end
+			d[c.ClassName.."#"..wi]=w; wi+=1
+		end
+	end
+	local sa=h:FindFirstChildOfClass("SurfaceAppearance")
+	if sa then d["SurfaceAppearance"]={ColorMap=sa.ColorMap~="" and sa.ColorMap or "(none)",NormalMap=sa.NormalMap~="" and sa.NormalMap or "(none)",RoughnessMap=sa.RoughnessMap~="" and sa.RoughnessMap or "(none)",MetalnessMap=sa.MetalnessMap~="" and sa.MetalnessMap or "(none)",AlphaMode=enums(sa.AlphaMode)} end
+	return d
+end
+
+-- =============================================
+-- UI  500 × 720
+-- =============================================
+local screen = Instance.new("ScreenGui")
+screen.Name="AccessoryEditor"; screen.ResetOnSpawn=false
+screen.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; screen.Parent=PlayerGui
+
+-- drag support
+local dragging,dragStart,startPos
+local function makeDraggable(frame, handle)
+	handle.InputBegan:Connect(function(i)
+		if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+			dragging=true; dragStart=i.Position; startPos=frame.Position
+			i.Changed:Connect(function() if i.UserInputState==Enum.UserInputState.End then dragging=false end end)
+		end
+	end)
+	handle.InputChanged:Connect(function(i)
+		if dragging and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+			local d=i.Position-dragStart
+			frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
+		end
+	end)
+end
+
+local shadow=Instance.new("Frame"); shadow.Size=UDim2.new(0,508,0,728)
+shadow.Position=UDim2.new(0,18,0.5,-368); shadow.BackgroundColor3=Color3.fromRGB(0,0,0)
+shadow.BackgroundTransparency=0.55; shadow.BorderSizePixel=0; shadow.ZIndex=1; shadow.Parent=screen
+Instance.new("UICorner",shadow).CornerRadius=UDim.new(0,14)
+
+local frame=Instance.new("Frame"); frame.Size=UDim2.new(0,500,0,720)
+frame.Position=UDim2.new(0,20,0.5,-360); frame.BackgroundColor3=Color3.fromRGB(13,13,18)
+frame.BorderSizePixel=0; frame.ZIndex=2; frame.Parent=screen; frame.Active=true
+Instance.new("UICorner",frame).CornerRadius=UDim.new(0,12)
+
+local topBar=Instance.new("Frame"); topBar.Size=UDim2.new(1,0,0,4)
+topBar.BackgroundColor3=Color3.fromRGB(99,102,241); topBar.BorderSizePixel=0
+topBar.ZIndex=3; topBar.Parent=frame; Instance.new("UICorner",topBar).CornerRadius=UDim.new(0,12)
+
+local header=Instance.new("Frame"); header.Size=UDim2.new(1,0,0,50)
+header.BackgroundTransparency=1; header.ZIndex=3; header.Parent=frame
+makeDraggable(frame, header)
+
+Instance.new("TextLabel",header).Size=UDim2.new(0,28,0,28)
+local _ico=header:FindFirstChildOfClass("TextLabel"); _ico.Position=UDim2.new(0,12,0,10)
+_ico.BackgroundTransparency=1; _ico.Text="🧰"; _ico.TextSize=18; _ico.ZIndex=3
+
+local titleLbl=Instance.new("TextLabel",header); titleLbl.Size=UDim2.new(0,280,0,26)
+titleLbl.Position=UDim2.new(0,44,0,8); titleLbl.BackgroundTransparency=1
+titleLbl.Text="ACCESSORY EDITOR"; titleLbl.TextColor3=Color3.fromRGB(235,235,255)
+titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl.Font=Enum.Font.GothamBold
+titleLbl.TextSize=13; titleLbl.ZIndex=3
+
+local subLbl=Instance.new("TextLabel",header); subLbl.Size=UDim2.new(0,320,0,14)
+subLbl.Position=UDim2.new(0,44,0,32); subLbl.BackgroundTransparency=1
+subLbl.Text="textures · mesh swap · replace · inspect · live"; subLbl.TextColor3=Color3.fromRGB(80,80,120)
+subLbl.TextXAlignment=Enum.TextXAlignment.Left; subLbl.Font=Enum.Font.Gotham; subLbl.TextSize=10; subLbl.ZIndex=3
+
+local rescanBtn=Instance.new("TextButton",header); rescanBtn.Size=UDim2.new(0,76,0,26)
+rescanBtn.Position=UDim2.new(1,-88,0,12); rescanBtn.BackgroundColor3=Color3.fromRGB(99,102,241)
+rescanBtn.Text="↺ Rescan"; rescanBtn.TextColor3=Color3.new(1,1,1)
+rescanBtn.Font=Enum.Font.GothamBold; rescanBtn.TextSize=11; rescanBtn.BorderSizePixel=0; rescanBtn.ZIndex=4
+Instance.new("UICorner",rescanBtn).CornerRadius=UDim.new(0,6)
+
+local sep1=Instance.new("Frame",frame); sep1.Size=UDim2.new(1,-24,0,1)
+sep1.Position=UDim2.new(0,12,0,52); sep1.BackgroundColor3=Color3.fromRGB(35,35,55); sep1.BorderSizePixel=0; sep1.ZIndex=3
+
+local countLbl=Instance.new("TextLabel",frame); countLbl.Size=UDim2.new(1,-24,0,18)
+countLbl.Position=UDim2.new(0,12,0,56); countLbl.BackgroundTransparency=1
+countLbl.Text="Scanning…"; countLbl.TextColor3=Color3.fromRGB(70,70,110)
+countLbl.TextXAlignment=Enum.TextXAlignment.Left; countLbl.Font=Enum.Font.Gotham; countLbl.TextSize=10; countLbl.ZIndex=3
+
+-- Tab bar (5 tabs)
+local tabBar=Instance.new("Frame",frame); tabBar.Size=UDim2.new(1,-24,0,26)
+tabBar.Position=UDim2.new(0,12,0,78); tabBar.BackgroundColor3=Color3.fromRGB(18,18,28)
+tabBar.BorderSizePixel=0; tabBar.ZIndex=3
+Instance.new("UICorner",tabBar).CornerRadius=UDim.new(0,6)
+
+local TABS = {"textures","mesh","replace","inspector","live"}
+local TAB_LABELS = {"🎨 Tex","🔩 Mesh","🔄 Replace","🔬 Inspect","📡 Live"}
+local tabBtns = {}
+for i,t in ipairs(TABS) do
+	local b=Instance.new("TextButton",tabBar)
+	b.Size=UDim2.new(0.2,-2,1,-4); b.Position=UDim2.new((i-1)*0.2,2,0,2)
+	b.BackgroundColor3=Color3.fromRGB(28,28,40); b.Text=TAB_LABELS[i]
+	b.TextColor3=Color3.fromRGB(90,90,130); b.Font=Enum.Font.GothamBold; b.TextSize=9
+	b.BorderSizePixel=0; b.ZIndex=4
+	Instance.new("UICorner",b).CornerRadius=UDim.new(0,5)
+	tabBtns[t]=b
+end
+
+-- Scroll areas (shared y=108, h=350 for most; live gets 460)
+local scrolls = {}
+local layouts = {}
+local function makeScroll(visible, height)
+	local s=Instance.new("ScrollingFrame",frame); s.Size=UDim2.new(1,-14,0,height or 350)
+	s.Position=UDim2.new(0,7,0,108); s.BackgroundTransparency=1
+	s.BorderSizePixel=0; s.ScrollBarThickness=3
+	s.ScrollBarImageColor3=Color3.fromRGB(99,102,241); s.CanvasSize=UDim2.new(0,0,0,0)
+	s.ZIndex=3; s.Visible=visible; s.Parent=frame  -- already set parent above
+	local l=Instance.new("UIListLayout",s); l.Padding=UDim.new(0,5)
+	local p=Instance.new("UIPadding",s); p.PaddingTop=UDim.new(0,4); p.PaddingBottom=UDim.new(0,4)
+	p.PaddingLeft=UDim.new(0,4); p.PaddingRight=UDim.new(0,4)
+	return s,l
+end
+
+for _,t in ipairs(TABS) do
+	local h = (t=="live") and 470 or 350
+	local s,l = makeScroll(t=="textures", h)
+	scrolls[t]=s; layouts[t]=l
+end
+
+local currentTab = "textures"
+local function setTab(tab)
+	currentTab = tab
+	for _,t in ipairs(TABS) do
+		scrolls[t].Visible = (t==tab)
+		tabBtns[t].BackgroundColor3 = (t==tab) and Color3.fromRGB(99,102,241) or Color3.fromRGB(28,28,40)
+		tabBtns[t].TextColor3       = (t==tab) and Color3.new(1,1,1) or Color3.fromRGB(90,90,130)
+	end
+end
+for _,t in ipairs(TABS) do
+	tabBtns[t].MouseButton1Click:Connect(function() setTab(t) end)
+end
+
+-- Bottom panel (URL copy) — sits below all scrolls
+local sep2=Instance.new("Frame",frame); sep2.Size=UDim2.new(1,-24,0,1)
+sep2.Position=UDim2.new(0,12,0,462); sep2.BackgroundColor3=Color3.fromRGB(35,35,55); sep2.BorderSizePixel=0; sep2.ZIndex=3
+
+local urlHdr=Instance.new("TextLabel",frame); urlHdr.Size=UDim2.new(1,-24,0,14)
+urlHdr.Position=UDim2.new(0,12,0,466); urlHdr.BackgroundTransparency=1
+urlHdr.Text="CREATOR STORE URLS (original server IDs)"; urlHdr.TextColor3=Color3.fromRGB(60,60,100)
+urlHdr.TextXAlignment=Enum.TextXAlignment.Left; urlHdr.Font=Enum.Font.GothamBold; urlHdr.TextSize=8; urlHdr.ZIndex=3
+
+local urlBox=Instance.new("TextBox",frame); urlBox.Size=UDim2.new(1,-20,0,120)
+urlBox.Position=UDim2.new(0,10,0,482); urlBox.BackgroundColor3=Color3.fromRGB(9,9,14)
+urlBox.TextColor3=Color3.fromRGB(130,180,255); urlBox.PlaceholderText="Scan to populate…"
+urlBox.PlaceholderColor3=Color3.fromRGB(40,40,70); urlBox.Text=""
+urlBox.TextXAlignment=Enum.TextXAlignment.Left; urlBox.TextYAlignment=Enum.TextYAlignment.Top
+urlBox.Font=Enum.Font.Code; urlBox.TextSize=10; urlBox.ClearTextOnFocus=false
+urlBox.MultiLine=true; urlBox.TextWrapped=true; urlBox.BorderSizePixel=0; urlBox.ZIndex=4
+Instance.new("UICorner",urlBox).CornerRadius=UDim.new(0,6)
+local _ubp=Instance.new("UIPadding",urlBox); _ubp.PaddingLeft=UDim.new(0,6); _ubp.PaddingTop=UDim.new(0,5)
+Instance.new("UIStroke",urlBox).Color=Color3.fromRGB(35,35,60)
+
+local copyUrlBtn=Instance.new("TextButton",frame); copyUrlBtn.Size=UDim2.new(0.5,-8,0,28)
+copyUrlBtn.Position=UDim2.new(0,10,0,606); copyUrlBtn.BackgroundColor3=Color3.fromRGB(99,102,241)
+copyUrlBtn.Text="⎘ Copy URLs"; copyUrlBtn.TextColor3=Color3.new(1,1,1)
+copyUrlBtn.Font=Enum.Font.GothamBold; copyUrlBtn.TextSize=11; copyUrlBtn.BorderSizePixel=0; copyUrlBtn.ZIndex=4
+Instance.new("UICorner",copyUrlBtn).CornerRadius=UDim.new(0,6)
+
+local copyRawBtn=Instance.new("TextButton",frame); copyRawBtn.Size=UDim2.new(0.5,-8,0,28)
+copyRawBtn.Position=UDim2.new(0.5,2,0,606); copyRawBtn.BackgroundColor3=Color3.fromRGB(30,30,48)
+copyRawBtn.Text="📋 Copy Inspector"; copyRawBtn.TextColor3=Color3.fromRGB(160,160,220)
+copyRawBtn.Font=Enum.Font.GothamBold; copyRawBtn.TextSize=11; copyRawBtn.BorderSizePixel=0; copyRawBtn.ZIndex=4
+Instance.new("UICorner",copyRawBtn).CornerRadius=UDim.new(0,6)
+Instance.new("UIStroke",copyRawBtn).Color=Color3.fromRGB(50,50,80)
+
+local liveClearBtn=Instance.new("TextButton",frame); liveClearBtn.Size=UDim2.new(0,64,0,16)
+liveClearBtn.Position=UDim2.new(1,-138,0,110); liveClearBtn.BackgroundColor3=Color3.fromRGB(50,20,20)
+liveClearBtn.Text="✕ Clear"; liveClearBtn.TextColor3=Color3.fromRGB(200,100,100)
+liveClearBtn.Font=Enum.Font.GothamBold; liveClearBtn.TextSize=9; liveClearBtn.BorderSizePixel=0
+liveClearBtn.ZIndex=5; liveClearBtn.Visible=false
+Instance.new("UICorner",liveClearBtn).CornerRadius=UDim.new(0,4)
+
+local livePauseBtn=Instance.new("TextButton",frame); livePauseBtn.Size=UDim2.new(0,64,0,16)
+livePauseBtn.Position=UDim2.new(1,-70,0,110); livePauseBtn.BackgroundColor3=Color3.fromRGB(28,28,42)
+livePauseBtn.Text="⏸ Pause"; livePauseBtn.TextColor3=Color3.fromRGB(180,180,220)
+livePauseBtn.Font=Enum.Font.GothamBold; livePauseBtn.TextSize=9; livePauseBtn.BorderSizePixel=0
+livePauseBtn.ZIndex=5; livePauseBtn.Visible=false
+Instance.new("UICorner",livePauseBtn).CornerRadius=UDim.new(0,4)
+
+-- show/hide live controls
+local _baseSetTab = setTab
+setTab = function(tab)
+	_baseSetTab(tab)
+	local isLive = tab=="live"
+	liveClearBtn.Visible = isLive; livePauseBtn.Visible = isLive
+end
+for _,t in ipairs(TABS) do
+	tabBtns[t].MouseButton1Click:Connect(function() setTab(t) end)
+end
+
+-- =============================================
+-- TOAST
+-- =============================================
+local function toast(msg,col)
+	local ex=screen:FindFirstChild("_toast"); if ex then ex:Destroy() end
+	local t=Instance.new("Frame",screen); t.Name="_toast"; t.Size=UDim2.new(0,340,0,34)
+	t.Position=UDim2.new(0.5,-170,1,-56); t.BackgroundColor3=col or Color3.fromRGB(99,102,241)
+	t.BorderSizePixel=0; t.ZIndex=20
+	Instance.new("UICorner",t).CornerRadius=UDim.new(0,8)
+	local tl=Instance.new("TextLabel",t); tl.Size=UDim2.new(1,0,1,0); tl.BackgroundTransparency=1
+	tl.Text=msg; tl.TextColor3=Color3.new(1,1,1); tl.Font=Enum.Font.GothamBold; tl.TextSize=12; tl.ZIndex=20
+	TweenService:Create(t,TweenInfo.new(0.25),{Position=UDim2.new(0.5,-170,1,-80)}):Play()
+	task.delay(2.6,function()
+		if t and t.Parent then
+			TweenService:Create(t,TweenInfo.new(0.25),{Position=UDim2.new(0.5,-170,1,-48),BackgroundTransparency=1}):Play()
+			task.wait(0.3); t:Destroy()
+		end
+	end)
+end
+
+-- =============================================
+-- CARD BUILDER HELPERS
+-- =============================================
+local C = {
+	bg      = Color3.fromRGB(20,20,30),
+	bgDark  = Color3.fromRGB(11,11,17),
+	border  = Color3.fromRGB(40,40,60),
+	accent  = Color3.fromRGB(99,102,241),
+	text    = Color3.fromRGB(220,220,255),
+	sub     = Color3.fromRGB(80,80,120),
+	code    = Color3.fromRGB(140,185,255),
+	green   = Color3.fromRGB(50,120,70),
+	greenTx = Color3.fromRGB(180,255,190),
+	purple  = Color3.fromRGB(70,40,140),
+	purpleTx= Color3.fromRGB(210,180,255),
+	warn    = Color3.fromRGB(160,60,60),
+	input   = Color3.fromRGB(255,200,100),
+}
+
+local function makeCard(parent, layout, heightPx)
+	local card=Instance.new("Frame",parent)
+	card.Size=UDim2.new(1,-8,0,heightPx); card.BackgroundColor3=C.bg
+	card.BorderSizePixel=0; card.ZIndex=4
+	Instance.new("UICorner",card).CornerRadius=UDim.new(0,8)
+	Instance.new("UIStroke",card).Color=C.border
+	return card
+end
+
+local function makeInput(parent, x, y, w, h, placeholder)
+	local box=Instance.new("TextBox",parent)
+	box.Size=UDim2.new(0,w,0,h); box.Position=UDim2.new(0,x,0,y)
+	box.BackgroundColor3=C.bgDark; box.TextColor3=C.input
+	box.PlaceholderText=placeholder; box.PlaceholderColor3=Color3.fromRGB(60,50,30)
+	box.Text=""; box.TextXAlignment=Enum.TextXAlignment.Left
+	box.Font=Enum.Font.Code; box.TextSize=10; box.ClearTextOnFocus=false
+	box.BorderSizePixel=0; box.ZIndex=5
+	Instance.new("UICorner",box).CornerRadius=UDim.new(0,5)
+	local p=Instance.new("UIPadding",box); p.PaddingLeft=UDim.new(0,6)
+	local stroke=Instance.new("UIStroke",box); stroke.Color=Color3.fromRGB(70,55,15); stroke.Thickness=1
+	box.Focused:Connect(function()    TweenService:Create(stroke,TweenInfo.new(0.12),{Color=Color3.fromRGB(220,160,30)}):Play() end)
+	box.FocusLost:Connect(function()  TweenService:Create(stroke,TweenInfo.new(0.12),{Color=Color3.fromRGB(70,55,15)}):Play()  end)
+	return box
+end
+
+local function makeBtn(parent, x, y, w, h, label, bgCol, txCol)
+	local b=Instance.new("TextButton",parent)
+	b.Size=UDim2.new(0,w,0,h); b.Position=UDim2.new(0,x,0,y)
+	b.BackgroundColor3=bgCol; b.Text=label; b.TextColor3=txCol
+	b.Font=Enum.Font.GothamBold; b.TextSize=10; b.BorderSizePixel=0; b.ZIndex=5
+	Instance.new("UICorner",b).CornerRadius=UDim.new(0,5)
+	return b
+end
+
+local function makeLbl(parent, x, y, w, h, text, col, size, font, xAlign)
+	local l=Instance.new("TextLabel",parent)
+	l.Size=UDim2.new(0,w,0,h); l.Position=UDim2.new(0,x,0,y)
+	l.BackgroundTransparency=1; l.Text=text; l.TextColor3=col
+	l.Font=font or Enum.Font.Gotham; l.TextSize=size or 10
+	l.TextXAlignment=xAlign or Enum.TextXAlignment.Left
+	l.TextTruncate=Enum.TextTruncate.AtEnd; l.ZIndex=5
+	return l
+end
+
+local function updateCanvas(scroll, layout)
+	scroll.CanvasSize=UDim2.new(0,0,0,layout.AbsoluteContentSize.Y+10)
+end
+
+-- =============================================
+-- TEXTURE TAB — per-slot edit cards
+-- =============================================
+local function buildTextureTab(accName, slots)
+	if #slots==0 then return end
+	local ROW = 56
+	local cardH = 36 + #slots*ROW + 6
+	local card = makeCard(scrolls.textures, layouts.textures, cardH)
+
+	-- header
+	local dot=Instance.new("Frame",card); dot.Size=UDim2.new(0,6,0,6); dot.Position=UDim2.new(0,10,0,10)
+	dot.BackgroundColor3=C.accent; dot.BorderSizePixel=0; dot.ZIndex=5
+	Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
+	makeLbl(card,22,4,360,18,accName,C.text,11,Enum.Font.GothamBold)
+	makeLbl(card,22,20,260,13,#slots.." slot(s) — clone-swap applied",C.sub,8)
+
+	for i,slot in ipairs(slots) do
+		local rowY = 34 + (i-1)*ROW
+
+		-- slot label
+		makeLbl(card,10,rowY,460,11,"🎨  "..slot.label,Color3.fromRGB(170,130,255),9,Enum.Font.GothamBold)
+
+		-- current id display
+		local curLbl=makeLbl(card,10,rowY+12,310,10,"id: "..(slot.id~="(none)" and slot.id or "—"),C.sub,8,Enum.Font.Code)
+		curLbl.TextTruncate=Enum.TextTruncate.AtEnd
+
+		-- copy current
+		local cpBtn=makeBtn(card,324,rowY+10,60,14,"⎘ Copy",Color3.fromRGB(25,25,40),Color3.fromRGB(120,120,180))
+		cpBtn.TextSize=8
+		cpBtn.MouseButton1Click:Connect(function()
+			if slot.id=="(none)" then toast("⚠ No ID") return end
+			setclipboard(slot.id); toast("⎘ "..slot.label,Color3.fromRGB(30,100,60))
+		end)
+
+		-- input
+		local inputW = 350
+		local box=makeInput(card,10,rowY+26,inputW,20,"New texture ID…")
+
+		-- apply
+		local applyBtn=makeBtn(card,inputW+14,rowY+26,112,20,"✏ Apply",C.green,C.greenTx)
+		applyBtn.MouseButton1Click:Connect(function()
+			local raw=box.Text
+			local nid=normalizeId(raw)
+			if not nid then toast("⚠ Invalid ID"); return end
+			local char=player.Character; if not char then toast("⚠ No char"); return end
+			local acc=char:FindFirstChild(accName); if not acc then toast("⚠ Not found — rescan"); return end
+
+			applyBtn.Text="⏳…"; applyBtn.BackgroundColor3=Color3.fromRGB(20,50,20)
+			task.spawn(function()
+				-- preload first so it's cached before we swap
+				pcall(function() ContentProvider:PreloadAsync({nid}) end)
+				local ok,res = applyTextureToSlot(acc, slot, nid)
+				if ok then
+					slot.id=nid; curLbl.Text="id: "..nid; curLbl.TextColor3=Color3.fromRGB(100,200,120)
+					applyBtn.Text="✓ Done"; applyBtn.BackgroundColor3=C.green
+					toast("✓ "..slot.label.." → "..nid, Color3.fromRGB(30,110,50))
+					task.delay(2,function()
+						if applyBtn and applyBtn.Parent then
+							applyBtn.Text="✏ Apply"; applyBtn.BackgroundColor3=C.green
+							curLbl.TextColor3=C.sub
+						end
+					end)
+				else
+					applyBtn.Text="✏ Apply"; applyBtn.BackgroundColor3=C.green
+					toast("⚠ "..tostring(res),C.warn)
+				end
+			end)
+		end)
+	end
+	updateCanvas(scrolls.textures, layouts.textures)
+end
+
+-- =============================================
+-- MESH TAB — swap mesh geometry
+-- =============================================
+local function buildMeshTab(accName, slots)
+	-- gather mesh info
+	local meshSlots = {}
+	for _,s in ipairs(slots) do
+		if s.meshId and s.meshId ~= "(none)" then
+			table.insert(meshSlots,s)
+		end
+	end
+
+	local cardH = 130 + math.max(#meshSlots,1)*28
+	local card = makeCard(scrolls.mesh, layouts.mesh, cardH)
+
+	makeLbl(card,22,4,360,18,accName,C.text,11,Enum.Font.GothamBold)
+	makeLbl(card,22,20,400,10,"Paste any asset ID: accessory, model, part with SpecialMesh",C.sub,8)
+
+	-- show current mesh ids
+	local rowY=34
+	if #meshSlots>0 then
+		makeLbl(card,10,rowY,460,10,"CURRENT MESH IDs",Color3.fromRGB(80,80,140),8,Enum.Font.GothamBold)
+		rowY+=12
+		for _,s in ipairs(meshSlots) do
+			makeLbl(card,10,rowY,20,12,"·",Color3.fromRGB(80,80,120),9)
+			local ml=makeLbl(card,20,rowY,380,12,s.label.."  →  "..s.meshId,C.code,9,Enum.Font.Code)
+			ml.TextTruncate=Enum.TextTruncate.AtEnd
+			local cpb=makeBtn(card,400,rowY,60,14,"⎘",Color3.fromRGB(22,22,36),Color3.fromRGB(110,110,180))
+			cpb.TextSize=8
+			cpb.MouseButton1Click:Connect(function()
+				setclipboard(s.meshId); toast("⎘ "..s.meshId, Color3.fromRGB(30,100,60))
+			end)
+			rowY+=16
+		end
+	else
+		makeLbl(card,10,rowY,460,12,"No mesh IDs detected on this accessory",C.sub,9)
+		rowY+=16
+	end
+
+	rowY+=6
+	makeLbl(card,10,rowY,460,10,"REPLACEMENT MESH / MODEL ASSET ID",Color3.fromRGB(80,80,140),8,Enum.Font.GothamBold)
+	rowY+=12
+	local meshBox=makeInput(card,10,rowY,340,22,"Asset ID (accessory, model, part…)")
+	rowY+=28
+
+	-- keep texture checkbox (toggle button)
+	local keepTex=true
+	local keepBtn=makeBtn(card,10,rowY,130,18,"✓ Keep orig texture",Color3.fromRGB(30,70,40),C.greenTx)
+	keepBtn.TextSize=8
+	keepBtn.MouseButton1Click:Connect(function()
+		keepTex=not keepTex
+		keepBtn.Text=(keepTex and "✓" or "○").." Keep orig texture"
+		keepBtn.BackgroundColor3=keepTex and Color3.fromRGB(30,70,40) or Color3.fromRGB(40,20,20)
+	end)
+
+	rowY+=24
+	local applyMeshBtn=makeBtn(card,10,rowY,200,24,"🔩 Swap Mesh (clone-swap)",C.purple,C.purpleTx)
+	applyMeshBtn.TextSize=10
+	applyMeshBtn.MouseButton1Click:Connect(function()
+		local raw=meshBox.Text
+		local nid=normalizeId(raw)
+		if not nid then toast("⚠ Invalid ID"); return end
+		local char=player.Character; if not char then toast("⚠ No char"); return end
+		local acc=char:FindFirstChild(accName); if not acc then toast("⚠ Not found — rescan"); return end
+
+		applyMeshBtn.Text="⏳ Loading…"; applyMeshBtn.BackgroundColor3=Color3.fromRGB(40,20,80)
+		task.spawn(function()
+			local ok,res=applyMeshToHandle(acc, nid, keepTex)
+			if ok then
+				applyMeshBtn.Text="✓ Swapped"; applyMeshBtn.BackgroundColor3=C.green
+				toast("✓ Mesh swapped on "..accName, Color3.fromRGB(30,110,50))
+				task.delay(2,function()
+					if applyMeshBtn and applyMeshBtn.Parent then
+						applyMeshBtn.Text="🔩 Swap Mesh (clone-swap)"; applyMeshBtn.BackgroundColor3=C.purple
+					end
+				end)
+			else
+				applyMeshBtn.Text="🔩 Swap Mesh (clone-swap)"; applyMeshBtn.BackgroundColor3=C.purple
+				toast("⚠ "..tostring(res),C.warn)
+			end
+		end)
+	end)
+
+	updateCanvas(scrolls.mesh, layouts.mesh)
+end
+
+-- =============================================
+-- FULL REPLACE TAB
+-- =============================================
+local function buildReplaceTab(accName, slots)
+	local cardH=110+math.max(#slots,1)*26
+	local card=makeCard(scrolls.replace, layouts.replace, cardH)
+
+	local dot=Instance.new("Frame",card); dot.Size=UDim2.new(0,6,0,6); dot.Position=UDim2.new(0,10,0,10)
+	dot.BackgroundColor3=C.accent; dot.BorderSizePixel=0; dot.ZIndex=5
+	Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
+	makeLbl(card,22,4,360,18,accName,C.text,11,Enum.Font.GothamBold)
+	makeLbl(card,22,20,400,10,"InsertService full asset swap — replaces entire accessory",C.sub,8)
+
+	local rowY=34
+	for _,s in ipairs(slots) do
+		makeLbl(card,10,rowY,16,12,"·",C.sub,9)
+		local sl=makeLbl(card,20,rowY,320,12,s.label.."  "..s.id,C.code,9,Enum.Font.Code)
+		sl.TextTruncate=Enum.TextTruncate.AtEnd
+		local cpb=makeBtn(card,342,rowY,56,16,"⎘ Copy",Color3.fromRGB(22,22,36),Color3.fromRGB(110,110,180))
+		cpb.TextSize=8
+		cpb.MouseButton1Click:Connect(function()
+			if s.id=="(none)" then toast("⚠ No ID") return end
+			setclipboard(s.id); toast("⎘ copied", Color3.fromRGB(30,100,60))
+		end)
+		rowY+=22
+	end
+
+	rowY=math.max(rowY, 60)
+	local box=makeInput(card,10,rowY,340,22,"Replacement accessory asset ID…")
+	local goBtn=makeBtn(card,354,rowY,114,22,"🔄 Replace",C.purple,C.purpleTx)
+
+	goBtn.MouseButton1Click:Connect(function()
+		local raw=box.Text=="" and "" or box.Text
+		local nid=normalizeId(raw)
+		if not nid then toast("⚠ Enter an asset ID"); return end
+		goBtn.Text="⏳ Loading…"; goBtn.BackgroundColor3=Color3.fromRGB(40,20,80)
+		fullReplace(accName, nid, function(ok,res)
+			if ok then
+				dot.BackgroundColor3=Color3.fromRGB(80,220,110)
+				goBtn.Text="✓ Done"; goBtn.BackgroundColor3=C.green
+				toast("✓ Replaced "..accName, Color3.fromRGB(30,110,50))
+			else
+				goBtn.Text="🔄 Replace"; goBtn.BackgroundColor3=C.purple
+				toast("⚠ "..tostring(res),C.warn)
+			end
+		end)
+	end)
+
+	updateCanvas(scrolls.replace, layouts.replace)
+end
+
+-- =============================================
+-- INSPECTOR TAB
+-- =============================================
+local SEC_COLS={
+	Accessory=Color3.fromRGB(99,102,241), Handle=Color3.fromRGB(60,180,120),
+	SpecialMesh=Color3.fromRGB(200,140,60), SurfaceAppearance=Color3.fromRGB(180,80,180),
+	Decal=Color3.fromRGB(255,140,60), Texture=Color3.fromRGB(255,190,80),
+	Attachment=Color3.fromRGB(100,210,200), Weld=Color3.fromRGB(220,200,80),
+}
+local function secColor(key)
+	for k,c in pairs(SEC_COLS) do if key:find(k) then return c end end
+	return Color3.fromRGB(130,130,180)
+end
+
+local function buildInspectorTab(accName, cfg)
+	-- banner
+	local banner=Instance.new("Frame",scrolls.inspector); banner.Size=UDim2.new(1,-8,0,24)
+	banner.BackgroundColor3=Color3.fromRGB(25,25,40); banner.BorderSizePixel=0; banner.ZIndex=4
+	Instance.new("UICorner",banner).CornerRadius=UDim.new(0,6)
+	Instance.new("UIStroke",banner).Color=C.accent
+	makeLbl(banner,10,0,460,24,"◈  "..accName,Color3.fromRGB(200,200,255),11,Enum.Font.GothamBold)
+
+	local sOrder={}; for k in pairs(cfg) do table.insert(sOrder,k) end
+	table.sort(sOrder,function(a,b)
+		local rank={Accessory=0,Handle=1}
+		local ra,rb=rank[a] or 99,rank[b] or 99
+		if ra~=rb then return ra<rb end return a<b
+	end)
+
+	for _,sk in ipairs(sOrder) do
+		local props=cfg[sk]; local sc=secColor(sk)
+		local sh=Instance.new("Frame",scrolls.inspector); sh.Size=UDim2.new(1,-8,0,18); sh.BackgroundTransparency=1; sh.ZIndex=4
+		local bar=Instance.new("Frame",sh); bar.Size=UDim2.new(0,3,1,0); bar.BackgroundColor3=sc; bar.BorderSizePixel=0; bar.ZIndex=5
+		Instance.new("UICorner",bar).CornerRadius=UDim.new(1,0)
+		local sl=Instance.new("TextLabel",sh); sl.Size=UDim2.new(1,-12,1,0); sl.Position=UDim2.new(0,10,0,0)
+		sl.BackgroundTransparency=1; sl.Text=sk; sl.TextColor3=sc; sl.Font=Enum.Font.GothamBold; sl.TextSize=9
+		sl.TextXAlignment=Enum.TextXAlignment.Left; sl.ZIndex=5
+
+		local pOrder={}; for k in pairs(props) do table.insert(pOrder,k) end; table.sort(pOrder)
+		for _,pk in ipairs(pOrder) do
+			local val=tostring(props[pk])
+			local row=Instance.new("Frame",scrolls.inspector); row.Size=UDim2.new(1,-8,0,20)
+			row.BackgroundColor3=Color3.fromRGB(16,16,24); row.BorderSizePixel=0; row.ZIndex=4
+			Instance.new("UICorner",row).CornerRadius=UDim.new(0,4)
+			local kl=Instance.new("TextLabel",row); kl.Size=UDim2.new(0.42,0,1,0); kl.Position=UDim2.new(0,8,0,0)
+			kl.BackgroundTransparency=1; kl.Text=pk; kl.TextColor3=Color3.fromRGB(130,130,190)
+			kl.TextXAlignment=Enum.TextXAlignment.Left; kl.Font=Enum.Font.Gotham; kl.TextSize=9
+			kl.TextTruncate=Enum.TextTruncate.AtEnd; kl.ZIndex=5
+			local vb=Instance.new("TextBox",row); vb.Size=UDim2.new(0.57,-8,0,16); vb.Position=UDim2.new(0.43,0,0.5,-8)
+			vb.BackgroundTransparency=1; vb.Text=val; vb.Font=Enum.Font.Code; vb.TextSize=9
+			vb.ClearTextOnFocus=false; vb.BorderSizePixel=0; vb.ZIndex=5
+			vb.TextXAlignment=Enum.TextXAlignment.Left; vb.TextTruncate=Enum.TextTruncate.AtEnd
+			if pk:find("Texture") or pk:find("Mesh") or pk:find("Map") or pk:find("Id") then vb.TextColor3=C.code
+			elseif val=="true" then vb.TextColor3=Color3.fromRGB(100,220,140)
+			elseif val=="false" then vb.TextColor3=Color3.fromRGB(220,100,100)
+			elseif val:find("RGB") then vb.TextColor3=Color3.fromRGB(255,200,100)
+			else vb.TextColor3=Color3.fromRGB(200,230,180) end
+			vb.Focused:Connect(function() vb:ReleaseFocus(); setclipboard(val); toast("⎘ "..pk) end)
+		end
+	end
+	scrolls.inspector.CanvasSize=UDim2.new(0,0,0,layouts.inspector.AbsoluteContentSize.Y+10)
+end
+
+-- =============================================
+-- LIVE FEED TAB
+-- =============================================
+local feedRows  = {}
+local livePaused = false
+local MAX_ROWS  = 300
+
+local FEED_TAG_COLORS = {
+	ADD     = Color3.fromRGB(80,220,130),
+	REMOVE  = Color3.fromRGB(220,80,80),
+	TEXTURE = Color3.fromRGB(120,180,255),
+	MESH    = Color3.fromRGB(255,160,70),
+	SA      = Color3.fromRGB(200,100,220),
+	WELD    = Color3.fromRGB(200,160,255),
+	ATTACH  = Color3.fromRGB(80,220,200),
+	PROP    = Color3.fromRGB(220,200,110),
+}
+
+local function liveTag(inst, prop)
+	if prop=="TextureID" or prop=="TextureId" or prop=="Texture" then return "TEXTURE" end
+	if prop=="ColorMap" or prop=="NormalMap" or prop=="RoughnessMap" or prop=="MetalnessMap" then return "SA" end
+	if prop=="MeshId" or prop=="MeshType" or prop=="Scale" or prop=="MeshSize" then return "MESH" end
+	if inst:IsA("WeldConstraint") or inst:IsA("Weld") then return "WELD" end
+	if inst:IsA("Attachment") then return "ATTACH" end
+	return "PROP"
+end
+
+local function liveVal(inst, prop)
+	local ok,v=pcall(function() return inst[prop] end)
+	if not ok then return "?" end
+	local t=typeof(v)
+	if t=="Vector3"  then return string.format("(%.2f,%.2f,%.2f)",v.X,v.Y,v.Z) end
+	if t=="CFrame"   then local p=v.Position return string.format("P(%.1f,%.1f,%.1f)",p.X,p.Y,p.Z) end
+	if t=="Color3"   then return string.format("RGB(%d,%d,%d)",math.round(v.R*255),math.round(v.G*255),math.round(v.B*255)) end
+	if t=="EnumItem" then local s=tostring(v) return s:match("%.([^%.]+)$") or s end
+	if t=="Instance" then return v.Name end
+	return tostring(v)
+end
+
+local function livePath(inst)
+	local parts={}; local cur=inst; local char=player.Character
+	while cur and cur~=char and cur~=game and #parts<6 do
+		table.insert(parts,1,cur.Name); cur=cur.Parent
+	end
+	return table.concat(parts,".")
+end
+
+local function rebuildLive()
+	for _,c in pairs(scrolls.live:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+	local start=math.max(1,#feedRows-MAX_ROWS+1)
+	for i=start,#feedRows do
+		local f=feedRows[i]
+		local row=Instance.new("Frame",scrolls.live)
+		row.Size=UDim2.new(1,-8,0,17)
+		row.BackgroundColor3=(i%2==0) and Color3.fromRGB(14,14,22) or Color3.fromRGB(18,18,28)
+		row.BorderSizePixel=0; row.ZIndex=4
+		Instance.new("UICorner",row).CornerRadius=UDim.new(0,3)
+
+		-- timestamp
+		local tl=Instance.new("TextLabel",row); tl.Size=UDim2.new(0,46,1,0); tl.Position=UDim2.new(0,3,0,0)
+		tl.BackgroundTransparency=1; tl.Text=f.ts; tl.TextColor3=Color3.fromRGB(55,55,85)
+		tl.Font=Enum.Font.Code; tl.TextSize=8; tl.TextXAlignment=Enum.TextXAlignment.Left; tl.ZIndex=5
+
+		-- tag
+		local tag=Instance.new("TextLabel",row); tag.Size=UDim2.new(0,50,0,13); tag.Position=UDim2.new(0,50,0.5,-6.5)
+		tag.BackgroundColor3=f.col; tag.BackgroundTransparency=0.25; tag.Text=f.tag
+		tag.TextColor3=Color3.new(1,1,1); tag.Font=Enum.Font.GothamBold; tag.TextSize=7; tag.ZIndex=5
+		Instance.new("UICorner",tag).CornerRadius=UDim.new(0,3)
+
+		-- content
+		local info=Instance.new("TextLabel",row); info.Size=UDim2.new(1,-110,1,0); info.Position=UDim2.new(0,105,0,0)
+		info.BackgroundTransparency=1; info.Text=f.text; info.TextColor3=f.col
+		info.Font=Enum.Font.Code; info.TextSize=8; info.TextXAlignment=Enum.TextXAlignment.Left
+		info.TextTruncate=Enum.TextTruncate.AtEnd; info.ZIndex=5
+
+		-- click to copy
+		local btn=Instance.new("TextButton",row); btn.Size=UDim2.new(1,0,1,0)
+		btn.BackgroundTransparency=1; btn.Text=""; btn.ZIndex=6
+		btn.MouseButton1Click:Connect(function()
+			setclipboard(f.text); toast("⎘ "..f.text:sub(1,50))
+		end)
+	end
+	scrolls.live.CanvasSize=UDim2.new(0,0,0,layouts.live.AbsoluteContentSize.Y+8)
+	-- scroll to bottom
+	local cy=layouts.live.AbsoluteContentSize.Y
+	local sh=scrolls.live.AbsoluteSize.Y
+	if cy>sh then scrolls.live.CanvasPosition=Vector2.new(0,cy-sh+8) end
+end
+
+local function pushFeed(tag, text)
+	if livePaused then return end
+	local col=FEED_TAG_COLORS[tag] or Color3.fromRGB(180,180,180)
+	local ts=string.format("[%05.1f]", os.clock()%1000)
+	table.insert(feedRows,{tag=tag,text=text,col=col,ts=ts})
+	if #feedRows>MAX_ROWS+60 then
+		local t={}; for i=#feedRows-MAX_ROWS+1,#feedRows do table.insert(t,feedRows[i]) end; feedRows=t
+	end
+	if currentTab=="live" then rebuildLive() end
+end
+
+liveClearBtn.MouseButton1Click:Connect(function() feedRows={}; rebuildLive(); toast("Feed cleared") end)
+livePauseBtn.MouseButton1Click:Connect(function()
+	livePaused=not livePaused
+	livePauseBtn.Text=livePaused and "▶ Resume" or "⏸ Pause"
+	livePauseBtn.BackgroundColor3=livePaused and Color3.fromRGB(60,40,10) or Color3.fromRGB(28,28,42)
+end)
+
+-- =============================================
+-- OVERRIDE ENGINE
+-- Each rule locks a specific property on a specific
+-- instance to a specific value. ANY time that property
+-- changes away from our value (server replication,
+-- game scripts, anything), we instantly re-apply.
+-- Uses a per-key cooldown to prevent infinite loops.
+-- =============================================
+
+-- overrides[n] = { accName, instName, prop, value, enabled, label }
+local overrides = {}
+
+-- cooldown set: keys currently being written by US so we don't
+-- react to our own writes and loop
+local overrideCooldown = {}
+
+-- texture props we care about for auto-reapply on ANY change
+local TEXTURE_PROPS = {
+	TextureID  = true,
+	TextureId  = true,
+	Texture    = true,
+	ColorMap   = true,
+	NormalMap  = true,
+	RoughnessMap = true,
+	MetalnessMap = true,
+	MeshId     = true,
+}
+
+local function applyOverride(acc, ov)
+	if not ov.enabled then return end
+	local handle = acc:FindFirstChild("Handle")
+	if not handle then return end
+
+	-- locate target instance
+	local target
+	if ov.instName == "Handle" then
+		target = handle
+	else
+		target = handle:FindFirstChild(ov.instName)
+			or acc:FindFirstChild(ov.instName, true)
+	end
+	if not target then return end
+
+	-- check current value — skip if already correct
+	local curOk, curVal = pcall(function() return tostring(target[ov.prop]) end)
+	if curOk and curVal == ov.value then return end
+
+	-- cooldown key prevents our own write from re-triggering
+	local lockKey = tostring(target) .. "|" .. ov.prop
+	if overrideCooldown[lockKey] then return end
+	overrideCooldown[lockKey] = true
+	task.delay(0.3, function() overrideCooldown[lockKey] = nil end)
+
+	if target == handle then
+		-- Handle is server-owned: must clone-swap
+		cloneSwapHandle(acc, function(h)
+			h[ov.prop] = ov.value
+			-- also apply all OTHER handle-level overrides for this acc
+			-- in the same swap so we don't double-swap
+			for _, other in ipairs(overrides) do
+				if other ~= ov and other.enabled
+					and other.accName == ov.accName
+					and other.instName == "Handle" then
+					pcall(function() h[other.prop] = other.value end)
+					local ok2 = tostring(h[other.prop])
+					local lk2 = tostring(h) .. "|" .. other.prop
+					overrideCooldown[lk2] = true
+					task.delay(0.3, function() overrideCooldown[lk2] = nil end)
+				end
+			end
+		end)
+	else
+		-- child instance (Decal, Texture, SurfaceAppearance…)
+		-- after a clone-swap the Handle is client-owned so children are too
+		pcall(function() target[ov.prop] = ov.value end)
+		-- if that silently failed (server still owns), clone-swap entire handle
+		-- and set on the clone
+		task.delay(0.05, function()
+			local stillWrong = false
+			pcall(function()
+				-- re-find after potential swap
+				local h2 = acc:FindFirstChild("Handle")
+				if not h2 then return end
+				local t2 = h2:FindFirstChild(ov.instName) or acc:FindFirstChild(ov.instName, true)
+				if not t2 then return end
+				stillWrong = tostring(t2[ov.prop]) ~= ov.value
+			end)
+			if stillWrong then
+				local lk2 = lockKey .. "_fallback"
+				if overrideCooldown[lk2] then return end
+				overrideCooldown[lk2] = true
+				task.delay(0.3, function() overrideCooldown[lk2] = nil end)
+				cloneSwapHandle(acc, function(h)
+					local t2 = h:FindFirstChild(ov.instName)
+					if t2 then pcall(function() t2[ov.prop] = ov.value end) end
+				end)
+			end
+		end)
+	end
+
+	pushFeed("TEXTURE", "⚡ REAPPLY → " .. ov.accName .. "." .. ov.instName .. "." .. ov.prop .. " = " .. ov.value)
+end
+
+-- Called whenever ANY texture property changes anywhere on an accessory.
+-- Checks all enabled overrides for that accessory and re-fires matching ones.
+local function onTexturePropChanged(inst, prop)
+	-- walk up to Accessory
+	local acc = inst
+	while acc and not acc:IsA("Accessory") do acc = acc.Parent end
+	if not acc then return end
+
+	local lockKey = tostring(inst) .. "|" .. prop
+	if overrideCooldown[lockKey] then return end
+
+	local instName = inst.Name
+	local accName  = acc.Name
+
+	for _, ov in ipairs(overrides) do
+		if ov.enabled and ov.accName == accName then
+			-- exact match: this specific property on this specific instance
+			if ov.instName == instName and ov.prop == prop then
+				task.spawn(function()
+					task.wait(0.05) -- let server settle
+					applyOverride(acc, ov)
+				end)
+			end
+		end
+	end
+end
+
+-- =============================================
+-- WATCH INSTANCE (Live feed + auto-reapply)
+-- =============================================
+local watchedConns = {}
+
+local PROPS_TO_WATCH = {
+	MeshPart         = {"TextureID","MeshId","Size","Color","Material","Transparency","Reflectance","CastShadow","Anchored","CanCollide","Massless","RenderFidelity"},
+	Part             = {"Size","Color","Material","Transparency","Reflectance","CastShadow","Anchored","CanCollide","Massless"},
+	SpecialMesh      = {"TextureId","MeshId","Scale","Offset","MeshType","VertexColor"},
+	Decal            = {"Texture","Transparency","Face"},
+	Texture          = {"Texture","Transparency","Face","StudsPerTileU","StudsPerTileV"},
+	SurfaceAppearance= {"ColorMap","NormalMap","RoughnessMap","MetalnessMap","AlphaMode"},
+	Attachment       = {"CFrame"},
+	WeldConstraint   = {"Enabled","Part0","Part1"},
+	Weld             = {"C0","C1","Part0","Part1","Enabled"},
+	Accessory        = {"AccessoryType"},
+}
+local function propsFor(inst)
+	return PROPS_TO_WATCH[inst.ClassName]
+		or (inst:IsA("BasePart") and PROPS_TO_WATCH.Part)
+		or {}
+end
+
+local function watchInst(inst)
+	if watchedConns[inst] then return end
+	local conns = {}
+	local path  = livePath(inst)
+
+	for _, prop in ipairs(propsFor(inst)) do
+		local ok, conn = pcall(function()
+			return inst:GetPropertyChangedSignal(prop):Connect(function()
+				local val = liveVal(inst, prop)
+				pushFeed(liveTag(inst, prop), path .. "." .. prop .. " = " .. val)
+
+				-- auto-reapply if this is a texture property
+				if TEXTURE_PROPS[prop] then
+					onTexturePropChanged(inst, prop)
+				end
+			end)
+		end)
+		if ok and conn then table.insert(conns, conn) end
+	end
+
+	table.insert(conns, inst.ChildAdded:Connect(function(child)
+		pushFeed("ADD", path .. " ← [" .. child.ClassName .. "] " .. child.Name)
+		task.wait()
+		watchInst(child)
+		for _, p in ipairs(propsFor(child)) do
+			local v = liveVal(child, p)
+			if v ~= "" and v ~= "false" and v ~= "0" and v ~= "?" then
+				pushFeed(liveTag(child, p), livePath(child) .. "." .. p .. " = " .. v)
+			end
+		end
+	end))
+
+	table.insert(conns, inst.ChildRemoved:Connect(function(child)
+		pushFeed("REMOVE", path .. " ✕ " .. child.Name .. " [" .. child.ClassName .. "]")
+		local old = watchedConns[child]
+		if old then
+			for _, c in ipairs(old) do pcall(function() c:Disconnect() end) end
+			watchedConns[child] = nil
+		end
+	end))
+
+	watchedConns[inst] = conns
+end
+
+local function watchAccessory(acc)
+	pushFeed("ADD", "══ Accessory: " .. acc.Name .. " ══")
+	watchInst(acc)
+	for _, d in ipairs(acc:GetDescendants()) do
+		watchInst(d)
+		for _, p in ipairs(propsFor(d)) do
+			local v = liveVal(d, p)
+			if v ~= "" and v ~= "false" and v ~= "0" and v ~= "?" then
+				pushFeed(liveTag(d, p), livePath(d) .. "." .. p .. " = " .. v)
+			end
+		end
+	end
+	-- Fire ALL enabled overrides for this accessory immediately on spawn/detect.
+	-- Wait a beat so the server finishes setting its own values first,
+	-- then we overwrite them. This is the respawn fix.
+	task.spawn(function()
+		task.wait(0.15)
+		for _, ov in ipairs(overrides) do
+			if ov.enabled and ov.accName == acc.Name then
+				applyOverride(acc, ov)
+				task.wait(0.02) -- stagger multi-rule swaps slightly
+			end
+		end
+	end)
+end
+
+local charWatchConns={}
+
+local function startWatch(char)
+	for _,c in ipairs(charWatchConns) do pcall(function() c:Disconnect() end) end; charWatchConns={}
+	for k,conns in pairs(watchedConns) do
+		for _,c in ipairs(conns) do pcall(function() c:Disconnect() end) end; watchedConns[k]=nil
+	end
+	for _,child in ipairs(char:GetChildren()) do
+		if child:IsA("Accessory") then watchAccessory(child) end
+	end
+	table.insert(charWatchConns, char.ChildAdded:Connect(function(child)
+		if child:IsA("Accessory") then
+			watchAccessory(child)
+			task.delay(1.5, function() if player.Character then scanAccessories(player.Character) end end)
+		end
+	end))
+	table.insert(charWatchConns, char.ChildRemoved:Connect(function(child)
+		if child:IsA("Accessory") then pushFeed("REMOVE","══ Removed: "..child.Name.." ══") end
+	end))
+end
+
+-- =============================================
+-- OVERRIDE TAB UI
+-- =============================================
+-- We replace one of the existing tabs — add as 6th tab
+-- Add override tab button
+local tabOverride = Instance.new("TextButton", tabBar)
+-- Resize all 6 tabs evenly
+local allTabBtns = {}
+for _,t in ipairs(TABS) do table.insert(allTabBtns, tabBtns[t]) end
+table.insert(allTabBtns, tabOverride)
+for i,b in ipairs(allTabBtns) do
+	b.Size     = UDim2.new(1/#allTabBtns,-2,1,-4)
+	b.Position = UDim2.new((i-1)/#allTabBtns,2,0,2)
+end
+tabOverride.BackgroundColor3=Color3.fromRGB(28,28,40)
+tabOverride.Text="🔒 Override"; tabOverride.TextColor3=Color3.fromRGB(90,90,130)
+tabOverride.Font=Enum.Font.GothamBold; tabOverride.TextSize=9; tabOverride.BorderSizePixel=0; tabOverride.ZIndex=4
+Instance.new("UICorner",tabOverride).CornerRadius=UDim.new(0,5)
+
+local scrollOv, layoutOv = makeScroll(false, 350)
+table.insert(TABS,"override"); scrolls.override=scrollOv; layouts.override=layoutOv; tabBtns.override=tabOverride
+
+-- patch setTab once more to include override
+local _setTab3 = setTab
+setTab = function(tab)
+	_setTab3(tab)
+	scrollOv.Visible=(tab=="override")
+	tabOverride.BackgroundColor3=(tab=="override") and Color3.fromRGB(99,102,241) or Color3.fromRGB(28,28,40)
+	tabOverride.TextColor3=(tab=="override") and Color3.new(1,1,1) or Color3.fromRGB(90,90,130)
+	liveClearBtn.Visible=(tab=="live"); livePauseBtn.Visible=(tab=="live")
+end
+tabOverride.MouseButton1Click:Connect(function() setTab("override") end)
+
+local function rebuildOverrideTab()
+	for _, c in pairs(scrollOv:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+
+	-- header / add new rule area
+	local addCard = makeCard(scrollOv, layoutOv, 140)
+	makeLbl(addCard,10,6,460,14,"ADD OVERRIDE RULE",Color3.fromRGB(180,160,255),10,Enum.Font.GothamBold)
+	makeLbl(addCard,10,20,460,10,"🔒 Any time the server changes this property, it is instantly re-applied.",Color3.fromRGB(120,200,120),8)
+	makeLbl(addCard,10,30,460,10,"Fires on every respawn too. Check 📡 Live to find exact instance/prop names.",C.sub,8)
+
+	makeLbl(addCard,10,44,80,10,"Accessory",C.sub,8)
+	makeLbl(addCard,120,44,80,10,"Instance",C.sub,8)
+	makeLbl(addCard,230,44,80,10,"Property",C.sub,8)
+	makeLbl(addCard,330,44,120,10,"Your Value (ID or number)",C.sub,8)
+
+	local fAcc  = makeInput(addCard, 10,  54, 105, 20, "e.g. JERSEY_RightShoulder")
+	local fInst = makeInput(addCard, 118, 54, 105, 20, "e.g. Handle or LeftNumber")
+	local fProp = makeInput(addCard, 226, 54,  95, 20, "e.g. TextureID")
+	local fVal  = makeInput(addCard, 324, 54, 140, 20, "rbxassetid://… or num")
+
+	local addBtn = makeBtn(addCard, 10, 82, 140, 26, "＋ Add Rule", Color3.fromRGB(99,102,241), Color3.new(1,1,1))
+	addBtn.TextSize = 11
+	addBtn.MouseButton1Click:Connect(function()
+		local accN  = fAcc.Text:match("^%s*(.-)%s*$")
+		local instN = fInst.Text:match("^%s*(.-)%s*$")
+		local propN = fProp.Text:match("^%s*(.-)%s*$")
+		local valN  = fVal.Text:match("^%s*(.-)%s*$")
+		local normV = normalizeId(valN) or valN
+		if accN=="" or instN=="" or propN=="" or valN=="" then toast("⚠ Fill in all 4 fields"); return end
+
+		table.insert(overrides, {
+			accName  = accN,
+			instName = instN,
+			prop     = propN,
+			value    = normV,
+			enabled  = true,
+			label    = accN.."."..instN.."."..propN,
+		})
+		fAcc.Text=""; fInst.Text=""; fProp.Text=""; fVal.Text=""
+		toast("✓ Rule added — auto-reapply active", Color3.fromRGB(30,110,50))
+		rebuildOverrideTab()
+
+		-- fire immediately on existing character
+		local char = player.Character
+		if char then
+			local acc = char:FindFirstChild(accN)
+			if acc then task.spawn(function() applyOverride(acc, overrides[#overrides]) end) end
+		end
+	end)
+
+	-- paste from live feed clipboard helper
+	local hintBtn = makeBtn(addCard, 160, 82, 300, 26, "→ Paste from Live (copy a row first)", Color3.fromRGB(22,22,36), Color3.fromRGB(160,140,220))
+	hintBtn.TextSize = 9
+	hintBtn.MouseButton1Click:Connect(function()
+		local cb = ""
+		pcall(function() cb = getclipboard() end)
+		local parts, val = cb:match("^([%w_%s%.]+)%s*=%s*(.+)$")
+		if parts and val then
+			local segs = {}
+			for s in parts:gmatch("[^%.]+") do table.insert(segs, s) end
+			if #segs >= 3 then
+				fAcc.Text  = segs[1]; fInst.Text = segs[2]; fProp.Text = segs[3]
+				fVal.Text  = val:match("^%s*(.-)%s*$")
+				toast("✓ Pasted — check fields then Add Rule")
+			elseif #segs == 2 then
+				fInst.Text = segs[1]; fProp.Text = segs[2]
+				fVal.Text  = val:match("^%s*(.-)%s*$")
+				toast("✓ Partial paste — fill Accessory name")
+			else
+				toast("⚠ Couldn't parse clipboard")
+			end
+		else
+			toast("⚠ Couldn't parse clipboard")
+		end
+	end)
+
+	-- list rows for each rule
+	if #overrides == 0 then
+		local none = makeCard(scrollOv, layoutOv, 32)
+		makeLbl(none, 10, 8, 460, 16, "No rules yet. Add one above.", C.sub, 10)
+		scrollOv.CanvasSize = UDim2.new(0,0,0,layoutOv.AbsoluteContentSize.Y+10)
+		return
+	end
+
+	-- summary bar
+	local activeCount = 0
+	for _, ov in ipairs(overrides) do if ov.enabled then activeCount+=1 end end
+	local sumCard = makeCard(scrollOv, layoutOv, 26)
+	sumCard.BackgroundColor3 = Color3.fromRGB(15,30,15)
+	local sumStroke = sumCard:FindFirstChildOfClass("UIStroke")
+	if sumStroke then sumStroke.Color = Color3.fromRGB(40,120,40) end
+	makeLbl(sumCard,10,6,460,14,
+		"⚡ "..activeCount.." active rule"..(activeCount==1 and "" or "s").." — auto-reapplying on every server change",
+		Color3.fromRGB(100,220,120),9,Enum.Font.GothamBold)
+
+	for i, ov in ipairs(overrides) do
+		local ruleCard = makeCard(scrollOv, layoutOv, 56)
+		local isOn = ov.enabled
+		local accentCol = isOn and Color3.fromRGB(40,140,60) or Color3.fromRGB(80,30,30)
+		local stroke2 = ruleCard:FindFirstChildOfClass("UIStroke")
+		if stroke2 then stroke2.Color = accentCol end
+
+		-- pulsing status dot
+		local dot = Instance.new("Frame", ruleCard)
+		dot.Size = UDim2.new(0,7,0,7); dot.Position = UDim2.new(0,10,0,9)
+		dot.BackgroundColor3 = isOn and Color3.fromRGB(80,255,120) or Color3.fromRGB(180,60,60)
+		dot.BorderSizePixel = 0; dot.ZIndex = 5
+		Instance.new("UICorner", dot).CornerRadius = UDim.new(1,0)
+
+		-- status badge
+		local badge = makeBtn(ruleCard, 10, 28, isOn and 56 or 56, 14,
+			isOn and "⚡ LIVE" or "⏸ OFF",
+			isOn and Color3.fromRGB(20,80,30) or Color3.fromRGB(60,20,20),
+			isOn and Color3.fromRGB(120,255,150) or Color3.fromRGB(200,100,100))
+		badge.TextSize = 8; badge.Active = false
+
+		-- label + value
+		makeLbl(ruleCard, 24, 4, 380, 13, ov.label, C.text, 10, Enum.Font.GothamBold)
+		local vl = makeLbl(ruleCard, 24, 17, 420, 10, "→  "..ov.value, C.code, 9, Enum.Font.Code)
+		vl.TextTruncate = Enum.TextTruncate.AtEnd
+
+		-- toggle
+		local togBtn = makeBtn(ruleCard, 72, 28, 68, 14,
+			isOn and "Disable" or "Enable",
+			Color3.fromRGB(30,30,50), Color3.fromRGB(160,160,220))
+		togBtn.TextSize = 8
+		togBtn.MouseButton1Click:Connect(function()
+			ov.enabled = not ov.enabled
+			rebuildOverrideTab()
+			if ov.enabled then
+				local char = player.Character
+				if char then
+					local acc = char:FindFirstChild(ov.accName)
+					if acc then task.spawn(function() applyOverride(acc, ov) end) end
+				end
+			end
+			toast((ov.enabled and "⚡ Enabled: " or "⏸ Disabled: ")..ov.label)
+		end)
+
+		-- fire now
+		local fireBtn = makeBtn(ruleCard, 144, 28, 66, 14, "▶ Fire Now", Color3.fromRGB(25,25,60), Color3.fromRGB(140,140,255))
+		fireBtn.TextSize = 8
+		fireBtn.MouseButton1Click:Connect(function()
+			local char = player.Character; if not char then toast("⚠ No char") return end
+			local acc = char:FindFirstChild(ov.accName)
+			if not acc then toast("⚠ "..ov.accName.." not found") return end
+			task.spawn(function() applyOverride(acc, ov) end)
+			toast("▶ Fired: "..ov.label)
+		end)
+
+		-- copy value
+		local cpBtn = makeBtn(ruleCard, 214, 28, 66, 14, "⎘ Copy ID", Color3.fromRGB(22,22,36), Color3.fromRGB(120,120,200))
+		cpBtn.TextSize = 8
+		cpBtn.MouseButton1Click:Connect(function()
+			setclipboard(ov.value); toast("⎘ "..ov.value)
+		end)
+
+		-- delete
+		local delBtn = makeBtn(ruleCard, 284, 28, 52, 14, "✕ Del", Color3.fromRGB(60,15,15), Color3.fromRGB(255,100,100))
+		delBtn.TextSize = 8
+		delBtn.MouseButton1Click:Connect(function()
+			table.remove(overrides, i); rebuildOverrideTab()
+			toast("✕ Rule deleted")
+		end)
+	end
+
+	scrollOv.CanvasSize = UDim2.new(0,0,0,layoutOv.AbsoluteContentSize.Y+10)
+end
+
+-- =============================================
+-- MAIN SCAN
+-- =============================================
+local allUrls=""
+local rawInspect=""
+
+local function getMainTex(acc)
+	local h=acc:FindFirstChild("Handle"); if not h then return "No Handle" end
+	if h:IsA("MeshPart") and h.TextureID~="" then return h.TextureID end
+	local sm=h:FindFirstChildOfClass("SpecialMesh"); if sm and sm.TextureId~="" then return sm.TextureId end
+	local d=h:FindFirstChildOfClass("Decal"); if d and d.Texture~="" then return d.Texture end
+	return "No Texture"
+end
+
+scanAccessories = function(character)
+	-- clear all tabs
+	for _,t in ipairs(TABS) do
+		for _,c in pairs(scrolls[t]:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+		scrolls[t].CanvasSize=UDim2.new(0,0,0,0)
+	end
+
+	local accs={}; local urlLines={}; local inspectLines={}
+	for _,obj in pairs(character:GetChildren()) do
+		if obj:IsA("Accessory") then
+			table.insert(accs, obj)
+		end
+	end
+	table.sort(accs, function(a,b) return a.Name<b.Name end)
+
+	for _,acc in ipairs(accs) do
+		local slots=deepScan(acc)
+		local mainTex=getMainTex(acc)
+
+		-- Textures tab
+		buildTextureTab(acc.Name, slots)
+
+		-- Mesh tab
+		buildMeshTab(acc.Name, slots)
+
+		-- Replace tab
+		buildReplaceTab(acc.Name, slots)
+
+		-- Inspector tab
+		local cfg=inspectAccessory(acc)
+		buildInspectorTab(acc.Name, cfg)
+
+		-- URL list
+		local id=numId(mainTex)
+		if id then
+			local slug=acc.Name:gsub("%s+","-"):gsub("[^%w%-]","")
+			table.insert(urlLines,"create.roblox.com/store/asset/"..id.."/"..slug)
+		end
+
+		-- raw inspect dump
+		table.insert(inspectLines,"═══ "..acc.Name.." ═══")
+		local sk={}; for k in pairs(cfg) do table.insert(sk,k) end; table.sort(sk)
+		for _,s in ipairs(sk) do
+			table.insert(inspectLines,"  ["..s.."]")
+			local pk={}; for k in pairs(cfg[s]) do table.insert(pk,k) end; table.sort(pk)
+			for _,p in ipairs(pk) do
+				table.insert(inspectLines,string.format("    %-26s %s",p,tostring(cfg[s][p])))
+			end
+		end
+		table.insert(inspectLines,"")
+	end
+
+	countLbl.Text=#accs.." accessor"..(#accs==1 and "y" or "ies").." found"
+	allUrls=table.concat(urlLines,"\n"); urlBox.Text=allUrls
+	rawInspect=table.concat(inspectLines,"\n")
+end
+
+copyUrlBtn.MouseButton1Click:Connect(function()
+	if allUrls=="" then toast("⚠ No URLs") return end
+	setclipboard(allUrls); toast("⎘ URLs copied!", Color3.fromRGB(30,110,50))
+end)
+copyRawBtn.MouseButton1Click:Connect(function()
+	if rawInspect=="" then toast("⚠ No data") return end
+	setclipboard(rawInspect); toast("📋 Inspector copied!")
+end)
+
+rescanBtn.MouseButton1Click:Connect(function()
+	local c=player.Character
+	if not c then toast("⚠ No character") return end
+	scanAccessories(c); startWatch(c); rebuildOverrideTab(); toast("↺ Rescanned!")
+end)
+
+local function onChar(char)
+	task.wait(1.2)
+	scanAccessories(char)
+	startWatch(char)
+end
+
+if player.Character then onChar(player.Character) end
+-- rebuild override tab when switching to it
+tabOverride.MouseButton1Click:Connect(rebuildOverrideTab)
+
+player.CharacterAdded:Connect(onChar)

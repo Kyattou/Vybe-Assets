@@ -1,0 +1,1671 @@
+--[[
++======================================================================+
+|              VYBE STREAMING  ·  LocalScript  v2.0                   |
+|                                                                      |
+|  TABS:  Import · Stadium · Jerseys · UI Editor · Prop Designer · Market
++======================================================================+
+--]]
+
+-- +====== SERVICES ======+
+local Players          = game:GetService("Players")
+local ReplicatedStorage= game:GetService("ReplicatedStorage")
+local HttpService      = game:GetService("HttpService")
+local TweenService     = game:GetService("TweenService")
+local PhysicsService   = game:GetService("PhysicsService")
+local UserInputService = game:GetService("UserInputService")
+local CollectionService= game:GetService("CollectionService")
+local ContentProvider  = game:GetService("ContentProvider")
+local RunService       = game:GetService("RunService")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local mouse     = player:GetMouse()
+
+-- +====== COLLISION GROUP ======+
+pcall(function()
+	if not PhysicsService:IsCollisionGroupRegistered("VybeNC") then
+		PhysicsService:RegisterCollisionGroup("VybeNC")
+		PhysicsService:CollisionGroupSetCollidable("VybeNC","Default",false)
+	end
+end)
+
+-- +====== REMOTES ======+
+local exportRemote   = ReplicatedStorage:FindFirstChild("ExportPartsRemote")
+local uploadRemote   = ReplicatedStorage:FindFirstChild("UploadPartsRemote")
+local downloadRemote = ReplicatedStorage:FindFirstChild("DownloadPartsRemote")
+local serverOnline   = exportRemote~=nil and uploadRemote~=nil and downloadRemote~=nil
+
+-- +====== CONSTANTS ======+
+local CHUNK_SIZE   = 100000
+local FIELD_LEN_FB = 360
+local FIELD_WID_FB = 160
+
+-- +====== STATE ======+
+local jsonChunks   = {}
+local currentChunk = 1
+local currentData  = nil
+local fullJson     = ""
+local moverGui     = nil
+local activeModel  = nil
+local MOVE_STEP    = 2
+local ROT_STEP     = 15
+
+-- Jersey state
+local detectedJerseys = {}
+local groups = {}
+local activeGroupIdx = nil
+local watchConns = {}
+local charConns  = {}
+local cooldowns  = {}
+
+-- UI Editor state
+local uiEditorElements = {}
+local selectedElement  = nil
+local uiCanvas         = nil
+local draggingElement  = false
+local dragOffsetX, dragOffsetY = 0, 0
+
+-- Prop Designer state
+local propParts   = {}
+local selectedProp= nil
+
+-- Cross-section variable pre-declarations
+local impIdTb
+local sdDataTb, sdDataLbl, sdScroll
+local mktSTb, mktGrid
+-- rebuildJMe and rebuildJGrp pre-declared above
+local buildMarket
+
+
+-- ====================================================================
+--[[  PALETTE  ]]
+-- ====================================================================
+
+local C = {
+	bg0    = Color3.fromRGB(5,   5,   5),
+	bg1    = Color3.fromRGB(10,  10,  10),
+	bg2    = Color3.fromRGB(16,  16,  16),
+	bg3    = Color3.fromRGB(22,  22,  22),
+	bdr    = Color3.fromRGB(36,  36,  36),
+	bdrHi  = Color3.fromRGB(80,  80,  80),
+	white  = Color3.fromRGB(255, 255, 255),
+	off    = Color3.fromRGB(200, 200, 200),
+	dim    = Color3.fromRGB(100, 100, 100),
+	muted  = Color3.fromRGB(48,  48,  48),
+	hover  = Color3.fromRGB(28,  28,  28),
+	sel    = Color3.fromRGB(255, 255, 255),
+	green  = Color3.fromRGB(72,  214, 95),
+	gbg    = Color3.fromRGB(8,   26,  12),
+	red    = Color3.fromRGB(220, 60,  60),
+	rbg    = Color3.fromRGB(26,  8,   8),
+	amber  = Color3.fromRGB(255, 185, 45),
+	abg    = Color3.fromRGB(26,  18,  4),
+	blue   = Color3.fromRGB(80,  140, 255),
+	bbg    = Color3.fromRGB(8,   14,  32),
+}
+
+local TF = TweenInfo.new(0.08, Enum.EasingStyle.Quad,  Enum.EasingDirection.Out)
+local TN = TweenInfo.new(0.15, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local TS = TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local TB = TweenInfo.new(0.35, Enum.EasingStyle.Back,  Enum.EasingDirection.Out)
+
+-- ====================================================================
+--[[  GUI HELPERS  ]]
+-- ====================================================================
+
+local function G(class, props, parent)
+	local i = Instance.new(class)
+	for k,v in pairs(props) do
+		if k ~= "Parent" then pcall(function() i[k]=v end) end
+	end
+	i.Parent = parent or nil
+	return i
+end
+
+local function corner(r, p) local c=Instance.new("UICorner",p); c.CornerRadius=UDim.new(0,r or 6) end
+local function stroke(p, col, t) local s=Instance.new("UIStroke",p); s.Color=col or C.bdr; s.Thickness=t or 1; return s end
+local function padding(p, l, t, r, b) local u=Instance.new("UIPadding",p); u.PaddingLeft=UDim.new(0,l or 0); u.PaddingTop=UDim.new(0,t or 0); u.PaddingRight=UDim.new(0,r or 0); u.PaddingBottom=UDim.new(0,b or 0) end
+local function vlist(p, gap) local l=Instance.new("UIListLayout",p); l.FillDirection=Enum.FillDirection.Vertical; l.SortOrder=Enum.SortOrder.LayoutOrder; l.Padding=UDim.new(0,gap or 0); return l end
+local function hlist(p, gap, ha, va) local l=Instance.new("UIListLayout",p); l.FillDirection=Enum.FillDirection.Horizontal; l.SortOrder=Enum.SortOrder.LayoutOrder; l.Padding=UDim.new(0,gap or 0); l.HorizontalAlignment=ha or Enum.HorizontalAlignment.Left; l.VerticalAlignment=va or Enum.VerticalAlignment.Center; return l end
+
+local function makeFrame(parent, size, pos, col, zi)
+	return G("Frame",{Size=size or UDim2.new(1,0,0,40), Position=pos or UDim2.new(0,0,0,0), BackgroundColor3=col or C.bg2, BorderSizePixel=0, ZIndex=zi or 3}, parent)
+end
+
+local function makeScroll(parent, size, pos, zi)
+	local s = G("ScrollingFrame",{Size=size or UDim2.new(1,0,1,0), Position=pos or UDim2.new(0,0,0,0), BackgroundTransparency=1, BorderSizePixel=0, ScrollBarThickness=3, ScrollBarImageColor3=Color3.fromRGB(55,55,55), CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollingDirection=Enum.ScrollingDirection.Y, ZIndex=zi or 4}, parent)
+	return s
+end
+
+local function makeLabel(parent, text, fs, col, bold, xa, zi)
+	return G("TextLabel",{Size=UDim2.new(1,0,0,fs+6), BackgroundTransparency=1, Text=text or "", TextColor3=col or C.off, Font=bold and Enum.Font.GothamBold or Enum.Font.Gotham, TextSize=fs or 12, TextXAlignment=xa or Enum.TextXAlignment.Left, TextYAlignment=Enum.TextYAlignment.Center, BorderSizePixel=0, ZIndex=zi or 5}, parent)
+end
+
+local function makeInput(parent, ph, h, zi)
+	local f = makeFrame(parent, UDim2.new(1,0,0,h or 36), nil, C.bg1, zi or 5)
+	corner(6, f)
+	local sk = stroke(f, C.bdr, 1)
+	local tb = G("TextBox",{Size=UDim2.new(1,-16,1,0), Position=UDim2.new(0,8,0,0), BackgroundTransparency=1, PlaceholderText=ph or "", PlaceholderColor3=C.dim, Text="", TextColor3=C.off, Font=Enum.Font.Gotham, TextSize=12, TextXAlignment=Enum.TextXAlignment.Left, ClearTextOnFocus=false, ZIndex=(zi or 5)+1}, f)
+	tb.Focused:Connect(function() TweenService:Create(sk,TF,{Color=C.bdrHi}):Play() end)
+	tb.FocusLost:Connect(function() TweenService:Create(sk,TF,{Color=C.bdr}):Play() end)
+	return tb, f, sk
+end
+
+local function makeButton(parent, text, isPrimary, h, zi, fontSize)
+	local b = G("TextButton",{
+		Size=UDim2.new(1,0,0,h or 38),
+		BackgroundColor3=isPrimary and C.white or C.bg3,
+		Text=text or "", TextColor3=isPrimary and C.bg0 or C.off,
+		Font=Enum.Font.GothamBold, TextSize=fontSize or 12,
+		BorderSizePixel=0, AutoButtonColor=false, ZIndex=zi or 5
+	}, parent)
+	corner(6, b)
+	if not isPrimary then stroke(b, C.bdr, 1) end
+	local hovBG = isPrimary and Color3.fromRGB(225,225,225) or C.hover
+	local baseBG = isPrimary and C.white or C.bg3
+	b.MouseEnter:Connect(function() TweenService:Create(b,TF,{BackgroundColor3=hovBG}):Play() end)
+	b.MouseLeave:Connect(function() TweenService:Create(b,TF,{BackgroundColor3=baseBG}):Play() end)
+	return b
+end
+
+local function makeSmallBtn(parent, text, col, tcol, w, h)
+	local b = G("TextButton",{Size=UDim2.new(0,w or 60,0,h or 26), BackgroundColor3=col or C.bg3, Text=text, TextColor3=tcol or C.off, Font=Enum.Font.GothamBold, TextSize=10, BorderSizePixel=0, AutoButtonColor=false, ZIndex=6}, parent)
+	corner(4, b); stroke(b, C.bdr, 1)
+	b.MouseEnter:Connect(function() b.BackgroundTransparency=0.2 end)
+	b.MouseLeave:Connect(function() b.BackgroundTransparency=0 end)
+	return b
+end
+
+local function makeDivider(parent)
+	local d = makeFrame(parent, UDim2.new(1,0,0,1), nil, C.bdr, 4)
+	d.BackgroundTransparency = 0
+	return d
+end
+
+local function makePill(parent, text, bg, tc)
+	local p = G("TextLabel",{Size=UDim2.new(0,0,0,18), AutomaticSize=Enum.AutomaticSize.X, BackgroundColor3=bg or C.bg3, Text="  "..text.."  ", TextColor3=tc or C.dim, Font=Enum.Font.GothamBold, TextSize=9, BorderSizePixel=0, ZIndex=7}, parent)
+	corner(99, p); return p
+end
+
+local function clearChildren(f)
+	for _,c in ipairs(f:GetChildren()) do
+		if not (c:IsA("UIListLayout") or c:IsA("UIPadding") or c:IsA("UIStroke") or c:IsA("UICorner") or c:IsA("UIGridLayout") or c:IsA("UISizeConstraint")) then
+			c:Destroy()
+		end
+	end
+end
+
+local function tw(obj, props, info) TweenService:Create(obj, info or TN, props):Play() end
+
+-- Section header inside a scroll list
+local function sectionHeader(parent, text)
+	local f = makeFrame(parent, UDim2.new(1,0,0,22), nil, C.bg0, 5)
+	f.BackgroundTransparency = 1
+	local bar = makeFrame(f, UDim2.new(0,2,0,11), UDim2.new(0,0,0.5,-5.5), C.white, 6)
+	corner(1,bar)
+	local l = makeLabel(f, text, 9, C.dim, true, Enum.TextXAlignment.Left, 6)
+	l.Size = UDim2.new(1,-10,1,0); l.Position = UDim2.new(0,8,0,0)
+	return f
+end
+
+-- ====================================================================
+--[[  STADIUM UTILITIES  ]]
+-- ====================================================================
+
+local function desCF(cf)
+	if cf.Components then local c=cf.Components; return CFrame.new(c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12]) end
+	local p,r,u,l=cf.Position,cf.Right,cf.Up,cf.Look
+	return CFrame.new(p[1],p[2],p[3],r[1],u[1],l[1],r[2],u[2],l[2],r[3],u[3],l[3])
+end
+
+local function serCF(cf)
+	local x,y,z,a,b,c2,d,e,f,g,h,i=cf:GetComponents()
+	return {Components={x,y,z,a,b,c2,d,e,f,g,h,i}}
+end
+
+local function bounds(parts)
+	if #parts==0 then return nil end
+	local mn=Vector3.new(math.huge,math.huge,math.huge)
+	local mx=Vector3.new(-math.huge,-math.huge,-math.huge)
+	for _,p in ipairs(parts) do
+		local pos,sz=p.Position,p.Size
+		mn=Vector3.new(math.min(mn.X,pos.X-sz.X/2),math.min(mn.Y,pos.Y-sz.Y/2),math.min(mn.Z,pos.Z-sz.Z/2))
+		mx=Vector3.new(math.max(mx.X,pos.X+sz.X/2),math.max(mx.Y,pos.Y+sz.Y/2),math.max(mx.Z,pos.Z+sz.Z/2))
+	end
+	return {Min=mn,Max=mx,Size=mx-mn,Center=(mn+mx)/2}
+end
+
+local function fieldGeo()
+	local function fp(n) for _,o in ipairs(workspace:GetDescendants()) do if o:IsA("BasePart") and o.Name==n then return o end end end
+	local N,S=fp("NorthEndzone"),fp("SouthEndzone")
+	if N and S then
+		local nP,sP=N.Position,S.Position; local v=nP-sP
+		return {length=v.Magnitude,width=math.max(N.Size.X,N.Size.Z,S.Size.X,S.Size.Z),center=Vector3.new((nP.X+sP.X)/2,0,(nP.Z+sP.Z)/2),direction=v.Unit,floorY=(nP.Y+sP.Y)/2}
+	end
+	local field=workspace:FindFirstChild("Field")
+	if not field then for _,o in ipairs(workspace:GetDescendants()) do if o.Name=="Field" and (o:IsA("Model") or o:IsA("BasePart")) then field=o;break end end end
+	if field then
+		local fpts={}; if field:IsA("BasePart") then table.insert(fpts,field) else for _,o in ipairs(field:GetDescendants()) do if o:IsA("BasePart") then table.insert(fpts,o) end end end
+		if #fpts>0 then local b=bounds(fpts); if b then
+			local sX,sZ=b.Size.X,b.Size.Z; local fLen,fWid,fDir
+			if sZ>=sX then fLen=sZ;fWid=sX;fDir=Vector3.new(0,0,1) else fLen=sX;fWid=sZ;fDir=Vector3.new(1,0,0) end
+			return {length=fLen,width=fWid,center=Vector3.new(b.Center.X,0,b.Center.Z),direction=fDir,floorY=b.Min.Y}
+		end end
+	end
+	local flY=0; local bp=workspace:FindFirstChild("Baseplate")
+	if bp and bp:IsA("BasePart") then flY=bp.Position.Y+bp.Size.Y/2 end
+	return {length=FIELD_LEN_FB,width=FIELD_WID_FB,center=Vector3.new(0,0,0),direction=Vector3.new(0,0,1),floorY=flY}
+end
+
+local function groundY(geo, excFolder)
+	local excl={}
+	if excFolder then for _,o in ipairs(excFolder:GetDescendants()) do if o:IsA("BasePart") then table.insert(excl,o) end end end
+	local rp=RaycastParams.new(); rp.FilterType=Enum.RaycastFilterType.Exclude; rp.FilterDescendantsInstances=excl; rp.IgnoreWater=true
+	local ori=Vector3.new(geo.center.X,500,geo.center.Z); local dir=Vector3.new(0,-1000,0); local cur=ori
+	for _=1,50 do
+		local res=workspace:Raycast(cur,dir,rp); if not res then break end
+		local hp=res.Instance; local nl=hp.Name:lower()
+		local isHelper=nl:find("invisible") or nl:find("collision") or nl:find("hitbox") or nl:find("barrier")
+		local isNotImp=true; if excFolder then local c=hp; while c do if c==excFolder then isNotImp=false;break end; c=c.Parent end end
+		if hp.Transparency<0.8 and isNotImp and not isHelper then return res.Position.Y end
+		table.insert(excl,hp); rp.FilterDescendantsInstances=excl; cur=res.Position+Vector3.new(0,-0.1,0)
+	end
+	return geo.floorY
+end
+
+local function autoFit(allParts, geo, folder)
+	local b=bounds(allParts); if not b then return false end
+	local szX,szZ=b.Size.X,b.Size.Z; local bestA,bestSc=0,math.huge
+	for _,a in ipairs({0,math.pi/2,math.pi,math.pi*1.5}) do
+		local c2,s2=math.abs(math.cos(a)),math.abs(math.sin(a))
+		local sc=math.abs(szX*c2+szZ*s2-geo.length)+math.abs(szX*s2+szZ*c2-geo.width)
+		if sc<bestSc then bestSc=sc;bestA=a end
+	end
+	local fA=math.atan2(geo.direction.X,geo.direction.Z); local finA=fA+bestA
+	local c3,s3=math.abs(math.cos(bestA)),math.abs(math.sin(bestA))
+	local eL=szX*c3+szZ*s3; local eW=szX*s3+szZ*c3
+	local scale=(geo.length*3.20/eL)*0.65+(geo.width*3.00/eW)*0.35
+	local pivX,pivZ=b.Center.X,b.Center.Z; local botY2=b.Min.Y
+	local rotCF=CFrame.Angles(0,finA,0); local gY=groundY(geo,folder)
+	local origD={}; for _,p in ipairs(allParts) do origD[p]={CFrame=p.CFrame,Size=p.Size} end
+	local minVis,minAny=math.huge,math.huge
+	for _,p in ipairs(allParts) do
+		local o=origD[p]; local relY=(o.CFrame.Position.Y-botY2)*scale; local hH=(o.Size.Y*scale)/2; local wY=gY+relY
+		minAny=math.min(minAny,wY-hH); local nl=p.Name:lower()
+		if p.Transparency<0.8 and not(nl:find("invisible") or nl:find("collision") or nl:find("hitbox")) then minVis=math.min(minVis,wY-hH) end
+	end
+	local effMin=minVis<math.huge and minVis or minAny; local yCorr=gY-effMin; local proc=0
+	for _,p in ipairs(allParts) do
+		local o=origD[p]; local oP=o.CFrame.Position
+		local relX=(oP.X-pivX)*scale; local relZ=(oP.Z-pivZ)*scale; local relY=(oP.Y-botY2)*scale
+		local rOff=rotCF*Vector3.new(relX,0,relZ)
+		p.Size=o.Size*scale; p.CFrame=CFrame.new(geo.center.X+rOff.X,gY+relY+yCorr,geo.center.Z+rOff.Z)*(rotCF*o.CFrame.Rotation)
+		proc=proc+1; if proc%100==0 then task.wait() end
+	end
+	return true
+end
+
+local function buildPartFromData(data)
+	local part
+	local cn=data.ClassName
+	if cn=="Part" then part=Instance.new("Part"); if data.Shape then pcall(function() part.Shape=Enum.PartType[data.Shape] end) end
+	elseif cn=="WedgePart" then part=Instance.new("WedgePart")
+	elseif cn=="CornerWedgePart" then part=Instance.new("CornerWedgePart")
+	elseif cn=="MeshPart" then part=Instance.new("MeshPart")
+	elseif cn=="TrussPart" then part=Instance.new("TrussPart")
+	else part=Instance.new("Part") end
+	part.Name=data.Name
+	part.Size=Vector3.new(data.Size[1],data.Size[2],data.Size[3])
+	part.CFrame=desCF(data.CFrame)
+	part.Color=Color3.new(data.Color[1],data.Color[2],data.Color[3])
+	if data.BrickColor then pcall(function() part.BrickColor=BrickColor.new(data.BrickColor) end) end
+	pcall(function() part.Material=Enum.Material[data.Material] end)
+	part.Transparency=data.Transparency or 0; part.Reflectance=data.Reflectance or 0
+	part.Anchored=data.Anchored~=nil and data.Anchored or true
+	part.CanCollide=data.CanCollide~=nil and data.CanCollide or true
+	pcall(function() part.TopSurface=Enum.SurfaceType[data.TopSurface] end)
+	pcall(function() part.BottomSurface=Enum.SurfaceType[data.BottomSurface] end)
+	if part:IsA("MeshPart") and data.MeshId then part.MeshId=data.MeshId; part.TextureID=data.TextureID or "" end
+	if data.Meshes then for _,md in ipairs(data.Meshes) do pcall(function()
+		local mesh; if md.ClassName=="SpecialMesh" then mesh=Instance.new("SpecialMesh"); mesh.MeshType=Enum.MeshType[md.MeshType]; mesh.MeshId=md.MeshId; mesh.TextureId=md.TextureId; mesh.Scale=Vector3.new(md.Scale[1],md.Scale[2],md.Scale[3]) end; if mesh then mesh.Name=md.Name;mesh.Parent=part end
+	end) end end
+	if data.Decals then for _,dd in ipairs(data.Decals) do pcall(function()
+		local d=Instance.new(dd.ClassName); d.Name=dd.Name; d.Texture=dd.Texture; d.Face=Enum.NormalId[dd.Face]; d.Transparency=dd.Transparency; d.Parent=part
+	end) end end
+	if data.SurfaceAppearances then for _,sd in ipairs(data.SurfaceAppearances) do pcall(function()
+		local sa=Instance.new("SurfaceAppearance"); sa.Name=sd.Name; pcall(function() sa.AlphaMode=Enum.AlphaMode[sd.AlphaMode] end); sa.ColorMap=sd.ColorMap; sa.MetalnessMap=sd.MetalnessMap; sa.NormalMap=sd.NormalMap; sa.RoughnessMap=sd.RoughnessMap; sa.Parent=part
+	end) end end
+	if (data.Transparency or 0)>=0.95 or not(data.CanCollide~=nil and data.CanCollide) then
+		part.CanCollide=false; part.CanTouch=false; part.CanQuery=false
+		pcall(function() part.CollisionGroup="VybeNC" end)
+	end
+	return part, data.Parent or "Parts", data.FullPath or ""
+end
+
+-- ====================================================================
+--[[  JERSEY ENGINE  ]]
+-- ====================================================================
+
+local function normTexId(raw)
+	if not raw or raw=="" then return nil end
+	if raw:match("^rbxassetid://%d+$") then return raw end
+	local n=raw:match("rbxassetid://(%d+)") or raw:match("[?&]id=(%d+)") or raw:match("^%s*(%d+)%s*$")
+	return n and ("rbxassetid://"..n) or nil
+end
+
+local function swapTex(acc, texId)
+	local h=acc:FindFirstChild("Handle"); if not h then return false end
+	local nh=h:Clone()
+	local ok=pcall(function()
+		if nh:IsA("MeshPart") then nh.TextureID=texId
+		else local sm=nh:FindFirstChildOfClass("SpecialMesh"); if sm then sm.TextureId=texId end end
+	end)
+	if not ok then nh:Destroy(); return false end
+	local cf=h.CFrame; nh.Anchored=false; h:Destroy(); nh.Parent=acc; nh.CFrame=cf
+	return true
+end
+
+local function activeGrp() return activeGroupIdx and groups[activeGroupIdx] or nil end
+
+local function pushChar(rp)
+	local char=rp.Character; if not char then return end
+	task.spawn(function()
+		task.wait(0.12); local ag=activeGrp(); if not ag then return end
+		for _,ch in ipairs(char:GetChildren()) do
+			if ch:IsA("Accessory") and ch.Name:sub(1,7)=="JERSEY_" then
+				local tex=ag.slots[ch.Name]
+				if tex then
+					local lk=rp.UserId..ch.Name
+					if not cooldowns[lk] then
+						cooldowns[lk]=true; task.delay(0.5,function() cooldowns[lk]=nil end)
+						pcall(function() ContentProvider:PreloadAsync({tex}) end)
+						swapTex(ch,tex)
+					end
+				end
+			end
+		end
+	end)
+end
+
+local function pushAll()
+	local ag=activeGrp(); if not ag then return end
+	for _,u in ipairs(ag.players) do
+		for _,rp in ipairs(Players:GetPlayers()) do if rp.Name:lower()==u:lower() then pushChar(rp);break end end
+	end
+end
+
+local function activateGroup(idx)
+	for _,cs in pairs(charConns) do for _,c in ipairs(cs) do pcall(function() c:Disconnect() end) end end
+	for _,cs in pairs(watchConns) do for _,c in ipairs(cs) do pcall(function() c:Disconnect() end) end end
+	charConns={}; watchConns={}; activeGroupIdx=idx
+	local ag=activeGrp(); if not ag then return end
+	for _,u in ipairs(ag.players) do
+		for _,rp in ipairs(Players:GetPlayers()) do
+			if rp.Name:lower()==u:lower() then
+				local function onC(char)
+					task.wait(0.18)
+					char.ChildAdded:Connect(function(ch)
+						if ch:IsA("Accessory") and ch.Name:sub(1,7)=="JERSEY_" then
+							task.wait(0.14); local tex=ag.slots[ch.Name]
+							if tex then pcall(function() ContentProvider:PreloadAsync({tex}) end); swapTex(ch,tex) end
+						end
+					end)
+					pushChar(rp)
+				end
+				if rp.Character then onC(rp.Character) end
+				if not charConns[rp.UserId] then charConns[rp.UserId]={} end
+				table.insert(charConns[rp.UserId],rp.CharacterAdded:Connect(onC)); break
+			end
+		end
+	end
+	pushAll()
+end
+
+-- ====================================================================
+--[[  MARKETPLACE DATA  ]]
+-- ====================================================================
+
+local MKT = {
+	{name="NFL Stadium",         id="7407505752", cat="Stadiums", desc="Full NFL stadium with seating & field lighting rigs"},
+	{name="College Bowl",        id="6910830935", cat="Stadiums", desc="Classic bowl-style college football stadium"},
+	{name="Soccer Arena",        id="6272093532", cat="Stadiums", desc="Modern soccer pitch with grandstands"},
+	{name="Baseball Park",       id="9023459301", cat="Stadiums", desc="Retro-style baseball diamond & grandstand"},
+	{name="Basketball Court",    id="8752301946", cat="Stadiums", desc="NBA-ready hardwood indoor court"},
+	{name="Hockey Rink",         id="7134985420", cat="Stadiums", desc="Professional ice hockey rink with dasher boards"},
+	{name="Football Turf",       id="6481929104", cat="Fields",   desc="Painted yard-line football turf field"},
+	{name="eSports Stage",       id="9501023847", cat="Fields",   desc="Cyberpunk broadcast-ready esports arena"},
+	{name="Dirt Oval Track",     id="8230917562", cat="Fields",   desc="Racing oval dirt surface with timing stands"},
+	{name="Camera Rig",          id="5938201743", cat="Props",    desc="Broadcast TV jib camera & monitor setup"},
+	{name="Press Box",           id="6742018390", cat="Props",    desc="Fully furnished press box interior"},
+	{name="Scoreboard Pack",     id="7891023456", cat="Props",    desc="Large LED scoreboard display system"},
+	{name="Locker Room",         id="8012934850", cat="Props",    desc="Team locker room with benches & lockers"},
+	{name="Concession Stand",    id="7623019234", cat="Props",    desc="Stadium food & drink concession booth"},
+	{name="Light Towers",        id="5612047839", cat="Props",    desc="High-mast floodlight tower array"},
+	{name="Tunnel Entrance",     id="6831920456", cat="Props",    desc="Player tunnel with smoke effects"},
+	{name="Home Jersey",         id="4512938470", cat="Jerseys",  desc="Classic white home uniform set"},
+	{name="Away Dark Jersey",    id="4601928374", cat="Jerseys",  desc="Black away uniform set"},
+	{name="Retro Stripe Kit",    id="5023847291", cat="Jerseys",  desc="Throwback horizontal stripe design"},
+	{name="Modern Gradient Kit", id="5819203745", cat="Jerseys",  desc="Contemporary gradient jersey design"},
+	{name="Referee Shirt",       id="6234019284", cat="Jerseys",  desc="Official black & white referee uniform"},
+	{name="Coach Polo",          id="5901823740", cat="Jerseys",  desc="Sideline coach polo shirt"},
+}
+local MKT_CATS = {"All","Stadiums","Fields","Props","Jerseys"}
+
+-- ====================================================================
+--[[  SCREEN GUI ROOT  ]]
+-- ====================================================================
+
+if playerGui:FindFirstChild("VybeStreaming") then playerGui.VybeStreaming:Destroy() end
+
+local screen = G("ScreenGui",{Name="VybeStreaming",ResetOnSpawn=false,ZIndexBehavior=Enum.ZIndexBehavior.Sibling}, playerGui)
+
+local WIN_W,WIN_H = 1100,720
+
+local win = G("Frame",{
+	Name="Win", Size=UDim2.new(0,WIN_W,0,WIN_H),
+	Position=UDim2.new(0.5,-WIN_W/2,0.5,-WIN_H/2),
+	BackgroundColor3=C.bg0, BorderSizePixel=0,
+	ClipsDescendants=true, ZIndex=2
+}, screen)
+corner(12, win)
+stroke(win, C.bdr, 1)
+
+-- ====================================================================
+--[[  TOP ACCENT BAR  ]]
+-- ====================================================================
+
+local topBar = makeFrame(win, UDim2.new(1,0,0,2), UDim2.new(0,0,0,0), C.white, 10)
+local topGrad = G("UIGradient",{Color=ColorSequence.new{ColorSequenceKeypoint.new(0,Color3.fromRGB(30,30,30)),ColorSequenceKeypoint.new(0.5,C.white),ColorSequenceKeypoint.new(1,Color3.fromRGB(30,30,30))}}, topBar)
+
+-- ====================================================================
+--[[  SIDEBAR NAV (vertical left rail)  ]]
+-- ====================================================================
+
+local SIDEBAR_W = 64
+
+local sidebar = makeFrame(win, UDim2.new(0,SIDEBAR_W,1,-2), UDim2.new(0,0,0,2), C.bg1, 5)
+local sideBar_line = makeFrame(sidebar, UDim2.new(0,1,1,0), UDim2.new(1,-1,0,0), C.bdr, 6)
+
+-- Logo at top of sidebar
+local logoBox = makeFrame(sidebar, UDim2.new(0,40,0,40), UDim2.new(0.5,-20,0,14), C.white, 7)
+corner(10, logoBox)
+local logoL = G("TextLabel",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Text="VS",TextColor3=C.bg0,Font=Enum.Font.GothamBlack,TextSize=13,TextXAlignment=Enum.TextXAlignment.Center,TextYAlignment=Enum.TextYAlignment.Center,ZIndex=8},logoBox)
+
+local NAV_ITEMS = {
+	{id="import",    icon="⬆",  label="Import"},
+	{id="stadium",   icon="🏟",  label="Stadium"},
+	{id="jerseys",   icon="👕",  label="Jerseys"},
+	{id="uieditor",  icon="🎨",  label="UI Edit"},
+	{id="propdesign",icon="🔧",  label="Props"},
+	{id="market",    icon="🛍",  label="Market"},
+}
+
+local navBtns   = {}
+local tabPanels = {}
+local currentTab= ""
+
+local navList = makeFrame(sidebar, UDim2.new(1,0,1,-70), UDim2.new(0,0,0,66), C.bg0, 6)
+navList.BackgroundTransparency=1
+vlist(navList, 2)
+
+for _,ni in ipairs(NAV_ITEMS) do
+	local nb = G("TextButton",{
+		Size=UDim2.new(1,0,0,56),
+		BackgroundColor3=C.bg1, BackgroundTransparency=1,
+		Text="", BorderSizePixel=0, AutoButtonColor=false, ZIndex=7
+	}, navList)
+
+	local icLbl = G("TextLabel",{Size=UDim2.new(1,0,0,26),Position=UDim2.new(0,0,0,8),BackgroundTransparency=1,Text=ni.icon,TextSize=18,Font=Enum.Font.GothamBold,TextXAlignment=Enum.TextXAlignment.Center,TextYAlignment=Enum.TextYAlignment.Center,ZIndex=8},nb)
+	local txtLbl = G("TextLabel",{Size=UDim2.new(1,0,0,14),Position=UDim2.new(0,0,0,34),BackgroundTransparency=1,Text=ni.label,TextColor3=C.dim,TextSize=8,Font=Enum.Font.GothamBold,TextXAlignment=Enum.TextXAlignment.Center,ZIndex=8},nb)
+
+	local selBar = makeFrame(nb, UDim2.new(0,3,0,30), UDim2.new(0,0,0.5,-15), C.white, 9)
+	corner(2, selBar); selBar.Visible=false
+
+	navBtns[ni.id] = {btn=nb, icon=icLbl, txt=txtLbl, bar=selBar}
+
+	nb.MouseEnter:Connect(function()
+		if currentTab~=ni.id then tw(nb,{BackgroundColor3=C.bg2,BackgroundTransparency=0},TF) end
+	end)
+	nb.MouseLeave:Connect(function()
+		if currentTab~=ni.id then tw(nb,{BackgroundColor3=C.bg1,BackgroundTransparency=1},TF) end
+	end)
+	nb.MouseButton1Click:Connect(function() end) -- wired below
+end
+
+-- ====================================================================
+--[[  MAIN CONTENT AREA (right of sidebar)  ]]
+-- ====================================================================
+
+local contentX = SIDEBAR_W + 1
+local contentW = WIN_W - contentX
+
+-- Top header strip
+local topHeader = makeFrame(win, UDim2.new(1,-SIDEBAR_W-1,0,52), UDim2.new(0,contentX,0,2), C.bg1, 5)
+local topHLine  = makeFrame(topHeader, UDim2.new(1,0,0,1), UDim2.new(0,0,1,-1), C.bdr, 6)
+
+local pageTitleL = G("TextLabel",{
+	Size=UDim2.new(1,-200,1,0), Position=UDim2.new(0,18,0,0),
+	BackgroundTransparency=1, Text="IMPORT", TextColor3=C.white,
+	Font=Enum.Font.GothamBlack, TextSize=16,
+	TextXAlignment=Enum.TextXAlignment.Left, TextYAlignment=Enum.TextYAlignment.Center, ZIndex=6
+}, topHeader)
+
+local pageSubL = G("TextLabel",{
+	Size=UDim2.new(0,400,0,14), Position=UDim2.new(0,18,0,30),
+	BackgroundTransparency=1, Text="Asset Import", TextColor3=C.dim,
+	Font=Enum.Font.Gotham, TextSize=10,
+	TextXAlignment=Enum.TextXAlignment.Left, ZIndex=6
+}, topHeader)
+
+-- User badge top right
+local thumbOk,thumbUrl=pcall(function() return Players:GetUserThumbnailAsync(player.UserId,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size100x100) end)
+
+local userBadge = makeFrame(topHeader, UDim2.new(0,150,0,36), UDim2.new(1,-158,0.5,-18), C.bg2, 7)
+corner(8, userBadge); stroke(userBadge, C.bdr, 1)
+local userAv = G("ImageLabel",{Size=UDim2.new(0,26,0,26),Position=UDim2.new(0,5,0.5,-13),BackgroundColor3=C.bg3,BorderSizePixel=0,ZIndex=8,Image=thumbOk and thumbUrl or ""},userBadge)
+corner(13, userAv)
+local userNm = G("TextLabel",{Size=UDim2.new(1,-38,1,0),Position=UDim2.new(0,36,0,0),BackgroundTransparency=1,Text=player.DisplayName,TextColor3=C.off,Font=Enum.Font.GothamBold,TextSize=11,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Center,ZIndex=8},userBadge)
+
+-- Close button
+local closeBtn = G("TextButton",{
+	Size=UDim2.new(0,36,0,36), Position=UDim2.new(1,-48,0.5,-18),
+	BackgroundColor3=C.bg2, Text="×", TextColor3=C.dim,
+	TextSize=20, Font=Enum.Font.GothamBold, BorderSizePixel=0, AutoButtonColor=false, ZIndex=7
+}, topHeader)
+corner(6, closeBtn); stroke(closeBtn, C.bdr, 1)
+closeBtn.MouseEnter:Connect(function() tw(closeBtn,{BackgroundColor3=C.red,TextColor3=C.white},TF) end)
+closeBtn.MouseLeave:Connect(function() tw(closeBtn,{BackgroundColor3=C.bg2,TextColor3=C.dim},TF) end)
+closeBtn.MouseButton1Click:Connect(function()
+	tw(win,{Size=UDim2.new(0,0,0,0),Position=UDim2.new(0.5,0,0.5,0)},TweenInfo.new(0.18,Enum.EasingStyle.Back,Enum.EasingDirection.In))
+	task.delay(0.2,function() screen:Destroy() end)
+end)
+
+-- Content panels container
+local panelArea = makeFrame(win, UDim2.new(1,-SIDEBAR_W-1,1,-90), UDim2.new(0,contentX,0,54), C.bg0, 3)
+
+-- ====================================================================
+--[[  STATUS BAR  ]]
+-- ====================================================================
+
+local statusBarF = makeFrame(win, UDim2.new(1,-SIDEBAR_W-1,0,36), UDim2.new(0,contentX,1,-36), C.bg1, 5)
+makeFrame(statusBarF, UDim2.new(1,0,0,1), UDim2.new(0,0,0,0), C.bdr, 6)
+
+local sDot = makeFrame(statusBarF, UDim2.new(0,6,0,6), UDim2.new(0,14,0.5,-3), C.white, 7)
+corner(3, sDot)
+
+local sLabel = G("TextLabel",{
+	Size=UDim2.new(1,-160,1,0),Position=UDim2.new(0,28,0,0),
+	BackgroundTransparency=1, Text="Welcome, "..player.DisplayName.."!",
+	TextColor3=C.dim, Font=Enum.Font.Gotham, TextSize=11,
+	TextXAlignment=Enum.TextXAlignment.Left, TextYAlignment=Enum.TextYAlignment.Center, ZIndex=6
+}, statusBarF)
+
+local verL = G("TextLabel",{
+	Size=UDim2.new(0,50,1,0),Position=UDim2.new(1,-58,0,0),
+	BackgroundTransparency=1, Text="v2.0", TextColor3=C.muted,
+	Font=Enum.Font.GothamBold, TextSize=9,
+	TextXAlignment=Enum.TextXAlignment.Right, TextYAlignment=Enum.TextYAlignment.Center, ZIndex=6
+}, statusBarF)
+
+local function setStatus(msg, col)
+	sLabel.Text = msg or ""; sLabel.TextColor3 = col or C.dim
+	tw(sDot,{BackgroundColor3=col or C.dim},TF)
+end
+
+-- ====================================================================
+--[[  LOADING OVERLAY  ]]
+-- ====================================================================
+
+local loadOverlay = makeFrame(win, UDim2.new(1,0,1,0), UDim2.new(0,0,0,0), Color3.fromRGB(0,0,0), 80)
+loadOverlay.BackgroundTransparency = 0.15; loadOverlay.Visible = false
+
+local loCard = makeFrame(loadOverlay, UDim2.new(0,340,0,200), UDim2.new(0.5,-170,0.5,-100), C.bg1, 81)
+corner(12,loCard); stroke(loCard,C.bdr,1)
+
+local loBrand = G("TextLabel",{Size=UDim2.new(1,0,0,18),Position=UDim2.new(0,0,0,14),BackgroundTransparency=1,Text="VYBE STREAMING",TextColor3=C.dim,Font=Enum.Font.GothamBlack,TextSize=10,TextXAlignment=Enum.TextXAlignment.Center,ZIndex=82},loCard)
+
+local loDotsF = makeFrame(loCard, UDim2.new(0,120,0,16), UDim2.new(0.5,-60,0,40), C.bg0, 82)
+loDotsF.BackgroundTransparency=1
+local loDots={}
+for di=1,5 do
+	local d=makeFrame(loDotsF,UDim2.new(0,12,0,12),UDim2.new(0,(di-1)*24,0.5,-6),Color3.fromRGB(26,26,26),83)
+	corner(6,d); table.insert(loDots,d)
+end
+
+local loTitle = G("TextLabel",{Size=UDim2.new(1,-24,0,22),Position=UDim2.new(0,12,0,68),BackgroundTransparency=1,Text="Loading...",TextColor3=C.white,Font=Enum.Font.GothamBold,TextSize=14,TextXAlignment=Enum.TextXAlignment.Center,ZIndex=82},loCard)
+local loSub   = G("TextLabel",{Size=UDim2.new(1,-24,0,16),Position=UDim2.new(0,12,0,92),BackgroundTransparency=1,Text="Please wait...",TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=11,TextXAlignment=Enum.TextXAlignment.Center,ZIndex=82},loCard)
+
+local loProgBg = makeFrame(loCard, UDim2.new(1,-32,0,4), UDim2.new(0,16,0,124), C.bg3, 82)
+corner(2,loProgBg); loProgBg.Visible=false
+local loProgFill = makeFrame(loProgBg, UDim2.new(0,0,1,0), UDim2.new(0,0,0,0), C.white, 83)
+corner(2,loProgFill)
+local loProgTxt = G("TextLabel",{Size=UDim2.new(1,-24,0,14),Position=UDim2.new(0,12,0,132),BackgroundTransparency=1,Text="0%",TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=10,TextXAlignment=Enum.TextXAlignment.Center,ZIndex=82},loCard)
+loProgTxt.Visible=false
+
+local loTweens={}
+local function startLoad(text,showProg)
+	loadOverlay.Visible=true; loTitle.Text=text or "Loading..."; loSub.Text="Please wait..."
+	loProgBg.Visible=showProg or false; loProgTxt.Visible=showProg or false
+	if showProg then loProgFill.Size=UDim2.new(0,0,1,0); loProgTxt.Text="0%" end
+	for _,t2 in ipairs(loTweens) do t2:Cancel() end; loTweens={}
+	for di,d in ipairs(loDots) do
+		local t2=TweenService:Create(d,TweenInfo.new(0.35,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true,(di-1)*0.1),{BackgroundColor3=C.white})
+		t2:Play(); table.insert(loTweens,t2)
+	end
+end
+local function stopLoad()
+	for _,t2 in ipairs(loTweens) do t2:Cancel() end; loTweens={}
+	for _,d in ipairs(loDots) do d.BackgroundColor3=Color3.fromRGB(26,26,26) end
+	loadOverlay.Visible=false; loProgBg.Visible=false; loProgTxt.Visible=false
+end
+local function updProg(cur,tot)
+	if not loProgBg.Visible then return end
+	local p=cur/tot; tw(loProgFill,{Size=UDim2.new(p,0,1,0)},TN)
+	loProgTxt.Text=string.format("%d%%  ·  %d / %d",math.floor(p*100),cur,tot)
+	loSub.Text=string.format("Processing %d of %d...",cur,tot)
+end
+
+-- ====================================================================
+--[[  MOVER UI  ]]
+-- ====================================================================
+
+local function launchMover(model)
+	activeModel=model
+	if moverGui then moverGui:Destroy() end
+	moverGui=G("ScreenGui",{Name="VybeMover",ResetOnSpawn=false,ZIndexBehavior=Enum.ZIndexBehavior.Sibling},playerGui)
+
+	local mp = makeFrame(nil,UDim2.new(0,300,0,520),UDim2.new(1,-316,0.5,-260),C.bg1)
+	mp.Parent=moverGui; corner(10,mp); stroke(mp,C.bdr,1)
+	makeFrame(mp,UDim2.new(1,0,0,2),UDim2.new(0,0,0,0),C.white,4)
+
+	local function L(text,y,sz,col,bold)
+		local l=makeLabel(mp,text,sz or 9,col or C.dim,bold,Enum.TextXAlignment.Left,5)
+		l.Size=UDim2.new(1,-24,0,sz and sz+6 or 14); l.Position=UDim2.new(0,12,0,y); return l
+	end
+	L("POSITION STUDIO",14,14,C.white,true)
+	L("WASD · QE rotate · RF elevate",32,10,C.dim)
+
+	local function getAll() local ps={}; if not activeModel or not activeModel.Parent then return ps end
+		for _,o in ipairs(activeModel:GetDescendants()) do if o:IsA("BasePart") then table.insert(ps,o) end end; return ps
+	end
+	local function moveAll(v) for _,p in ipairs(getAll()) do p.CFrame=p.CFrame+v end end
+	local function rotAll(deg)
+		local ps=getAll(); local b2=bounds(ps); if not b2 then return end
+		local pivot=b2.Center; local r=CFrame.Angles(0,math.rad(deg),0)
+		local orig={}; for _,p in ipairs(ps) do orig[p]=p.CFrame end
+		for _,p in ipairs(ps) do local o=orig[p]; local rel=o.Position-pivot; p.CFrame=CFrame.new(pivot+r*rel)*(r*o.Rotation) end
+	end
+	local function scaleAll(f)
+		local ps=getAll(); local b2=bounds(ps); if not b2 then return end
+		local pivot=b2.Center; local orig={}; for _,p in ipairs(ps) do orig[p]={CFrame=p.CFrame,Size=p.Size} end
+		for _,p in ipairs(ps) do local o=orig[p]; p.Size=o.Size*f; p.CFrame=CFrame.new(pivot+(o.CFrame.Position-pivot)*f)*o.CFrame.Rotation end
+	end
+
+	local function mkB(text,x,y,w,h,cb,prim)
+		local b=G("TextButton",{Size=UDim2.new(0,w,0,h or 30),Position=UDim2.new(0,x,0,y),BackgroundColor3=prim and C.white or C.bg3,Text=text,TextColor3=prim and C.bg0 or C.off,Font=Enum.Font.GothamBold,TextSize=10,BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},mp)
+		corner(5,b); if not prim then stroke(b,C.bdr,1) end
+		b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=prim and Color3.fromRGB(220,220,220) or C.hover},TF) end)
+		b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=prim and C.white or C.bg3},TF) end)
+		b.MouseButton1Click:Connect(cb); return b
+	end
+
+	local P=12; local BW=70
+
+	L("TRANSLATE",60,9,C.dim,true)
+	mkB("▲ FWD",    P,     76,BW,28,function() moveAll(Vector3.new(0,0,-MOVE_STEP)) end)
+	mkB("↑ UP",     P+BW+6,76,BW,28,function() moveAll(Vector3.new(0,MOVE_STEP,0)) end)
+	mkB("◄ LEFT",   P,    108,BW,28,function() moveAll(Vector3.new(-MOVE_STEP,0,0)) end)
+	mkB("► RIGHT",  P+BW+6,108,BW,28,function() moveAll(Vector3.new(MOVE_STEP,0,0)) end)
+	mkB("▼ BACK",   P,    140,BW,28,function() moveAll(Vector3.new(0,0,MOVE_STEP)) end)
+	mkB("↓ DOWN",   P+BW+6,140,BW,28,function() moveAll(Vector3.new(0,-MOVE_STEP,0)) end)
+
+	L("ROTATE",180,9,C.dim,true)
+	mkB("↺ CCW",P,   196,BW,28,function() rotAll(-ROT_STEP) end)
+	mkB("↻ CW", P+BW+6,196,BW,28,function() rotAll(ROT_STEP) end)
+
+	local spdL=L("Move: 2  ·  Rot: 15°",234,9,C.dim)
+	local function refreshSpd() spdL.Text=string.format("Move: %.1f  ·  Rot: %d°",MOVE_STEP,ROT_STEP) end
+	mkB("½×",P,   250,50,24,function() MOVE_STEP=math.max(0.5,MOVE_STEP/2);refreshSpd() end)
+	mkB("2×",P+54,250,50,24,function() MOVE_STEP=math.min(64,MOVE_STEP*2);refreshSpd() end)
+	mkB("RST",P+108,250,50,24,function() MOVE_STEP=2;ROT_STEP=15;refreshSpd() end)
+
+	L("SCALE",284,9,C.dim,true)
+	local svs={{0.9,"90%"},{0.95,"95%"},{1.05,"105%"},{1.1,"110%"},{1.25,"125%"},{1.5,"150%"},{1.75,"175%"},{2,"200%"}}
+	for si,sv in ipairs(svs) do
+		local row=math.floor((si-1)/4); local col=(si-1)%4
+		mkB(sv[2],P+col*58,300+row*32,54,28,function() scaleAll(sv[1]) end)
+	end
+
+	-- confirm/delete
+	local cBtn=mkB("✓  CONFIRM",P,432,120,40,nil,true); cBtn.TextSize=12; cBtn.Font=Enum.Font.GothamBlack
+	cBtn.MouseButton1Click:Connect(function()
+		activeModel=nil; moverGui:Destroy(); moverGui=nil
+		setStatus("Stadium confirmed & locked!",C.green); win.Visible=true
+	end)
+	local dBtn=G("TextButton",{Size=UDim2.new(0,120,0,40),Position=UDim2.new(0,P+128,0,432),BackgroundColor3=C.rbg,Text="✕  DELETE",TextColor3=C.red,Font=Enum.Font.GothamBold,TextSize=12,BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},mp)
+	corner(5,dBtn); stroke(dBtn,Color3.fromRGB(50,14,14),1)
+	dBtn.MouseButton1Click:Connect(function()
+		if activeModel and activeModel.Parent then activeModel:Destroy() end
+		activeModel=nil; moverGui:Destroy(); moverGui=nil
+		setStatus("Stadium deleted"); win.Visible=true
+	end)
+
+	local kc=UserInputService.InputBegan:Connect(function(inp,gp)
+		if gp or not activeModel then return end
+		if inp.UserInputType~=Enum.UserInputType.Keyboard then return end
+		local k=inp.KeyCode
+		if k==Enum.KeyCode.W then moveAll(Vector3.new(0,0,-MOVE_STEP))
+		elseif k==Enum.KeyCode.S then moveAll(Vector3.new(0,0,MOVE_STEP))
+		elseif k==Enum.KeyCode.A then moveAll(Vector3.new(-MOVE_STEP,0,0))
+		elseif k==Enum.KeyCode.D then moveAll(Vector3.new(MOVE_STEP,0,0))
+		elseif k==Enum.KeyCode.R then moveAll(Vector3.new(0,MOVE_STEP,0))
+		elseif k==Enum.KeyCode.F then moveAll(Vector3.new(0,-MOVE_STEP,0))
+		elseif k==Enum.KeyCode.Q then rotAll(-ROT_STEP)
+		elseif k==Enum.KeyCode.E then rotAll(ROT_STEP) end
+	end)
+	moverGui.Destroying:Connect(function() kc:Disconnect() end)
+end
+
+-- Shared import function
+local function doImportAsset(rawId)
+	local id=tostring(rawId):match("(%d+)")
+	if not id then setStatus("Invalid Asset ID",C.red); return end
+	id=tonumber(id)
+	startLoad("Loading Asset "..id.."..."); setStatus("Fetching asset "..id.."...",C.dim); task.wait(0.1)
+	local ok,objs=pcall(function() return game:GetObjects("rbxassetid://"..id) end)
+	if not ok or not objs or #objs==0 then stopLoad(); setStatus("Asset load failed — check the ID",C.red); return end
+	local model=Instance.new("Model"); model.Name="VybeAsset_"..id
+	for _,o in ipairs(objs) do o.Parent=model end
+	local parts={}
+	for _,o in ipairs(model:GetDescendants()) do
+		if o:IsA("BasePart") then
+			if o.Transparency>=0.8 then o.CanCollide=false;o.CanTouch=false;o.CanQuery=false;o.Massless=true; pcall(function() o.CollisionGroup="VybeNC" end) end
+			table.insert(parts,o)
+		end
+	end
+	if #parts==0 then model:Destroy(); stopLoad(); setStatus("Asset has no BaseParts",C.red); return end
+	model.Parent=workspace
+	loTitle.Text="Auto-fitting to field..."; task.wait(0.1)
+	local geo=fieldGeo(); local resized=autoFit(parts,geo,model)
+	local bst,bv=nil,0
+	for _,o in ipairs(model:GetDescendants()) do if o:IsA("BasePart") and o.Transparency<0.5 then local v=o.Size.X*o.Size.Y*o.Size.Z; if v>bv then bv=v;bst=o end end end
+	if bst then pcall(function() model.PrimaryPart=bst end) end
+	stopLoad()
+	setStatus(string.format("Asset %d imported · %d parts%s",id,#parts,resized and " · Auto-fitted" or ""),C.green)
+	win.Visible=false; launchMover(model)
+end
+
+-- ====================================================================
+--[[  NAV SWITCH  ]]
+-- ====================================================================
+
+local PAGE_SUBTITLES = {
+	import    = "Import any Roblox asset by ID — auto-fits to your field",
+	stadium   = "Cloud sync, export, upload & download stadium builds",
+	jerseys   = "Apply jersey textures — manage groups & auto-push on spawn",
+	uieditor  = "Design in-game UI elements visually with live preview",
+	propdesign= "Create, paint & export custom props and structures",
+	market    = "Free asset marketplace — one-click import",
+}
+
+local function setTab(id)
+	currentTab=id
+	pageTitleL.Text=id:upper()
+	pageSubL.Text=PAGE_SUBTITLES[id] or ""
+	for tid,nd in pairs(navBtns) do
+		local on=(tid==id)
+		tw(nd.btn,{BackgroundColor3=on and C.bg2 or C.bg1,BackgroundTransparency=on and 0 or 1},TF)
+		tw(nd.txt,{TextColor3=on and C.white or C.dim},TF)
+		nd.bar.Visible=on
+	end
+	for tid,pan in pairs(tabPanels) do pan.Visible=(tid==id) end
+end
+
+for _,ni in ipairs(NAV_ITEMS) do
+	navBtns[ni.id].btn.MouseButton1Click:Connect(function() setTab(ni.id) end)
+end
+
+local function newPanel()
+	local p=makeFrame(panelArea,UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),C.bg0,3)
+	p.Visible=false; return p
+end
+
+do -- section
+-- ====================================================================
+--[[  PANEL: IMPORT  ]]
+-- ====================================================================
+
+local pImport = newPanel(); tabPanels["import"]=pImport
+
+-- centered column
+local impCol = makeFrame(pImport,UDim2.new(0,580,1,-20),UDim2.new(0.5,-290,0,10),C.bg0)
+impCol.BackgroundTransparency=1; vlist(impCol,14)
+
+-- Hero card
+local impHero = makeFrame(impCol,UDim2.new(1,0,0,110),nil,C.bg1)
+corner(10,impHero); stroke(impHero,C.bdr,1)
+makeFrame(impHero,UDim2.new(1,0,0,2),UDim2.new(0,0,0,0),C.white,5)
+G("TextLabel",{Size=UDim2.new(1,0,0,44),Position=UDim2.new(0,0,0,24),BackgroundTransparency=1,Text="ASSET IMPORTER",TextColor3=C.white,Font=Enum.Font.GothamBlack,TextSize=30,TextXAlignment=Enum.TextXAlignment.Center,ZIndex=5},impHero)
+G("TextLabel",{Size=UDim2.new(1,0,0,18),Position=UDim2.new(0,0,0,70),BackgroundTransparency=1,Text="Paste any Roblox Asset ID or URL · Auto-fits to your field · Ready in seconds",TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=11,TextXAlignment=Enum.TextXAlignment.Center,ZIndex=5},impHero)
+
+-- Input card
+local impInputCard = makeFrame(impCol,UDim2.new(1,0,0,130),nil,C.bg1)
+corner(10,impInputCard); stroke(impInputCard,C.bdr,1); padding(impInputCard,18,16,18,16); vlist(impInputCard,10)
+makeLabel(impInputCard,"ASSET ID OR ROBLOX URL",9,C.dim,true)
+impIdTb,impIdF,_ = makeInput(impInputCard,"e.g.  7407505752  or  https://www.roblox.com/library/7407505752",44,6)
+impIdTb.TextSize=13
+local impGoBtn = makeButton(impInputCard,"⬆  IMPORT ASSET",true,46,6,15)
+impGoBtn.Font=Enum.Font.GothamBlack
+impGoBtn.MouseButton1Click:Connect(function()
+	local raw=impIdTb.Text:match("^%s*(.-)%s*$")
+	if raw=="" then setStatus("Enter an Asset ID first",C.red); return end
+	doImportAsset(raw)
+end)
+
+-- How it works
+local impHowCard = makeFrame(impCol,UDim2.new(1,0,0,0),nil,C.bg1)
+impHowCard.AutomaticSize=Enum.AutomaticSize.Y; corner(10,impHowCard); stroke(impHowCard,C.bdr,1); padding(impHowCard,18,14,18,14); vlist(impHowCard,10)
+makeLabel(impHowCard,"HOW IT WORKS",9,C.dim,true)
+local stps={{"1","Paste any Asset ID or URL into the field above"},{"2","Click IMPORT ASSET — loads directly into the game"},{"3","Auto-Fit detects your field and scales the asset"},{"4","Use Position Studio to fine-tune placement (WASD)"},{"5","CONFIRM to lock in place, or DELETE to remove"}}
+for _,s in ipairs(stps) do
+	local row=makeFrame(impHowCard,UDim2.new(1,0,0,24),nil,C.bg0); row.BackgroundTransparency=1
+	hlist(row,10)
+	local nb=makeFrame(row,UDim2.new(0,22,0,22),nil,C.white,6); corner(5,nb)
+	G("TextLabel",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Text=s[1],TextColor3=C.bg0,Font=Enum.Font.GothamBlack,TextSize=11,TextXAlignment=Enum.TextXAlignment.Center,TextYAlignment=Enum.TextYAlignment.Center,ZIndex=7},nb)
+	local dl=makeLabel(row,s[2],11,C.off); dl.Size=UDim2.new(1,-32,0,24); dl.TextYAlignment=Enum.TextYAlignment.Center
+end
+
+
+end -- section
+
+do -- section
+-- ====================================================================
+--[[  PANEL: STADIUM  ]]
+-- ====================================================================
+
+local pStadium = newPanel(); tabPanels["stadium"]=pStadium
+
+-- two-column layout
+local sdSplitter = makeFrame(pStadium,UDim2.new(1,-16,1,-16),UDim2.new(0,8,0,8),C.bg0)
+sdSplitter.BackgroundTransparency=1; hlist(sdSplitter,8)
+
+local sdLeft = makeFrame(sdSplitter,UDim2.new(0,270,1,0),nil,C.bg1)
+corner(8,sdLeft); stroke(sdLeft,C.bdr,1)
+local sdLeftScroll=makeScroll(sdLeft,UDim2.new(1,-4,1,-4),UDim2.new(0,2,0,2),5)
+vlist(sdLeftScroll,6); padding(sdLeftScroll,10,10,6,10)
+
+local sdRight = makeFrame(sdSplitter,UDim2.new(1,-278,1,0),nil,C.bg1)
+corner(8,sdRight); stroke(sdRight,C.bdr,1)
+local sdRightHdr=makeFrame(sdRight,UDim2.new(1,0,0,34),UDim2.new(0,0,0,0),C.bg2); corner(8,sdRightHdr)
+makeFrame(sdRightHdr,UDim2.new(1,0,0,8),UDim2.new(0,0,1,-8),C.bg2,4)
+sdDataLbl=makeLabel(sdRightHdr,"JSON DATA",9,C.dim,true); sdDataLbl.Size=UDim2.new(1,-16,1,0); sdDataLbl.Position=UDim2.new(0,10,0,0)
+sdScroll=makeScroll(sdRight,UDim2.new(1,-10,1,-42),UDim2.new(0,5,0,38),5)
+sdDataTb=G("TextBox",{Size=UDim2.new(1,-12,1,0),Position=UDim2.new(0,6,0,0),BackgroundTransparency=1,Text=serverOnline and "Export a model to begin..." or "Paste JSON or use Asset ID...",TextColor3=Color3.fromRGB(65,65,65),TextSize=11,Font=Enum.Font.Code,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,TextWrapped=true,MultiLine=true,ClearTextOnFocus=false,ZIndex=6},sdScroll)
+
+-- Left panel contents
+local function sdSection(txt) sectionHeader(sdLeftScroll,txt) end
+local function sdInput(ph) local tb,_,_2=makeInput(sdLeftScroll,ph,34,6); return tb end
+local function sdBtn(txt,prim) local b=makeButton(sdLeftScroll,txt,prim,36,6,12); return b end
+
+local sdIdInput, sdModelInput, sdExportBtn, sdUploadBtn, sdDownloadBtn
+
+if serverOnline then
+	sdSection("SAVE ID"); sdIdInput=sdInput("Save ID  (e.g. stadium-v3)")
+	sdSection("EXPORT"); sdModelInput=sdInput("Model name"); sdExportBtn=sdBtn("Export Model",false)
+	sdSection("CLOUD"); sdUploadBtn=sdBtn("Upload to Cloud",true); sdDownloadBtn=sdBtn("Download from Cloud",false)
+end
+
+sdSection("PASTE JSON")
+local sdPasteBtn=sdBtn("Paste JSON from Clipboard",false)
+local sdImportBtn=sdBtn("Import JSON Parts",true)
+
+local function splitChunks(j) jsonChunks={}; local cs=math.min(CHUNK_SIZE,200000)
+	for i=1,#j,cs do table.insert(jsonChunks,j:sub(i,math.min(i+cs-1,#j))) end
+end
+local function reassemble() fullJson=table.concat(jsonChunks,""); return fullJson end
+local function updateSDViewer()
+	if #jsonChunks==0 then return end
+	sdDataTb.Text=jsonChunks[currentChunk]
+	sdDataLbl.Text=string.format("JSON  ·  %d/%d chunks  ·  %.1fKB",currentChunk,#jsonChunks,#jsonChunks[currentChunk]/1024)
+	sdScroll.CanvasSize=UDim2.new(0,0,0,sdDataTb.TextBounds.Y+24)
+end
+
+if sdExportBtn then sdExportBtn.MouseButton1Click:Connect(function()
+	local mn=(sdModelInput.Text:match("^%s*(.-)%s*$") or ""); if mn=="" then setStatus("Enter a model name",C.red); return end
+	startLoad("Exporting '"..mn.."'..."); task.wait(0.1)
+	local ok,res=pcall(function() return exportRemote:InvokeServer(mn) end); stopLoad()
+	if not ok then setStatus("Export error: "..tostring(res),C.red); return end
+	currentData=res; fullJson=res; splitChunks(res); currentChunk=1; updateSDViewer()
+	setStatus(string.format("Exported '%s' · %.1fKB",mn,#res/1024),C.green)
+end) end
+
+if sdUploadBtn then sdUploadBtn.MouseButton1Click:Connect(function()
+	if not currentData then setStatus("Export first",C.red); return end
+	local sid=sdIdInput and sdIdInput.Text or ""; if sid=="" then setStatus("Enter a save ID",C.red); return end
+	startLoad("Uploading...",true); task.wait(0.1)
+	local ud=#jsonChunks>0 and reassemble() or currentData
+	local ok,res=pcall(function() return uploadRemote:InvokeServer(ud,sid,{uploadedBy=player.Name}) end)
+	if ok and res and res.success then updProg(1,1); task.wait(0.3); stopLoad(); setStatus("Uploaded · ID: "..sid,C.green)
+	else stopLoad(); setStatus("Upload failed",C.red) end
+end) end
+
+if sdDownloadBtn then sdDownloadBtn.MouseButton1Click:Connect(function()
+	local sid=sdIdInput and sdIdInput.Text or ""; if sid=="" then setStatus("Enter a save ID",C.red); return end
+	startLoad("Downloading..."); task.wait(0.1)
+	local ok,res=pcall(function() return downloadRemote:InvokeServer(sid) end); stopLoad()
+	if ok and res then currentData=res; fullJson=res; splitChunks(res); currentChunk=1; updateSDViewer(); setStatus("Downloaded · Ready!",C.green)
+	else setStatus("Download failed",C.red) end
+end) end
+
+sdPasteBtn.MouseButton1Click:Connect(function()
+	local jc=""
+	pcall(function() local cl=UserInputService:GetTextFromClipboard(); if cl and #cl>2 then local t=cl:match("^%s*(.-)%s*$"); if t:sub(1,1)=="[" or t:sub(1,1)=="{" then jc=t end end end)
+	if jc=="" then local bt=(sdDataTb.Text or ""):match("^%s*(.-)%s*$"); if #bt>2 and (bt:sub(1,1)=="[" or bt:sub(1,1)=="{") then jc=bt end end
+	if jc=="" then setStatus("No JSON found — copy from website first",C.red); return end
+	if not pcall(function() HttpService:JSONDecode(jc) end) then setStatus("Invalid JSON",C.red); return end
+	currentData=jc; fullJson=jc; splitChunks(jc); currentChunk=1; updateSDViewer()
+	setStatus(string.format("JSON loaded · %.1fKB · Ready!",#jc/1024),C.green)
+end)
+
+sdImportBtn.MouseButton1Click:Connect(function()
+	if not currentData then setStatus("No data — paste JSON first",C.red); return end
+	startLoad("Parsing...",true); task.wait(0.1)
+	local jstr=#jsonChunks>0 and reassemble() or currentData
+	local ok,pData=pcall(function() return HttpService:JSONDecode(jstr) end)
+	if not ok or type(pData)~="table" then stopLoad(); setStatus("Invalid JSON",C.red); return end
+	loTitle.Text="Creating parts..."; task.wait(0.1)
+	local model=Instance.new("Model"); model.Name="VybeStadium"; model.Parent=workspace
+	local subs={}; local partLookup={}; local created=0
+	for i,pd2 in ipairs(pData) do
+		pcall(function()
+			local part,pName,fp=buildPartFromData(pd2)
+			if not subs[pName] then local s=Instance.new("Model"); s.Name=pName; s.Parent=model; subs[pName]=s end
+			part.Parent=subs[pName]; if fp~="" then partLookup[fp]=part end
+		end)
+		created=created+1; if created%10==0 then updProg(created,#pData); task.wait() end
+	end
+	loTitle.Text="Auto-fitting..."; task.wait(0.1)
+	local allP={}
+	for _,o in ipairs(model:GetDescendants()) do if o:IsA("BasePart") then if o.Transparency>=0.8 then o.CanCollide=false;o.CanTouch=false;o.CanQuery=false;o.Massless=true end; table.insert(allP,o) end end
+	local resized=false
+	if #allP>0 then resized=autoFit(allP,fieldGeo(),model) end
+	local bst,bv=nil,0
+	for _,o in ipairs(model:GetDescendants()) do if o:IsA("BasePart") and o.Transparency<0.5 then local v=o.Size.X*o.Size.Y*o.Size.Z; if v>bv then bv=v;bst=o end end end
+	if bst then model.PrimaryPart=bst end
+	stopLoad(); setStatus(string.format("Imported · %d parts%s",created,resized and " · Auto-fitted" or ""),C.green)
+	win.Visible=false; launchMover(model)
+end)
+
+
+end -- section
+
+do -- section
+-- ====================================================================
+--[[  PANEL: JERSEYS  ]]
+-- ====================================================================
+
+local pJerseys = newPanel(); tabPanels["jerseys"]=pJerseys
+
+local jSubBar=makeFrame(pJerseys,UDim2.new(1,-16,0,40),UDim2.new(0,8,0,8),C.bg1)
+corner(8,jSubBar); stroke(jSubBar,C.bdr,1); hlist(jSubBar,4); padding(jSubBar,4,4,4,4)
+
+local jScanBtn=G("TextButton",{Size=UDim2.new(0,110,0,32),Position=UDim2.new(1,-118,0,4),BackgroundColor3=C.white,Text="↺  SCAN",TextColor3=C.bg0,Font=Enum.Font.GothamBold,TextSize=11,BorderSizePixel=0,AutoButtonColor=false,ZIndex=7},pJerseys)
+corner(6,jScanBtn)
+jScanBtn.MouseEnter:Connect(function() tw(jScanBtn,{BackgroundColor3=Color3.fromRGB(220,220,220)},TF) end)
+jScanBtn.MouseLeave:Connect(function() tw(jScanBtn,{BackgroundColor3=C.white},TF) end)
+
+local jSubBtns={}; local jSubPanels={}; local curJSub=""
+
+local function setJSub(name)
+	curJSub=name
+	for n,b in pairs(jSubBtns) do
+		local on=(n==name)
+		tw(b,{BackgroundColor3=on and C.white or Color3.fromRGB(10,10,10), TextColor3=on and C.bg0 or C.dim},TF)
+	end
+	for n,p in pairs(jSubPanels) do p.Visible=(n==name) end
+end
+
+for _,jt in ipairs({"Me","Groups"}) do
+	local jb=G("TextButton",{Size=UDim2.new(0.5,-4,1,0),BackgroundColor3=Color3.fromRGB(10,10,10),Text=(jt=="Me" and "👤  MY JERSEYS" or "🏀  GROUPS"),TextColor3=C.dim,Font=Enum.Font.GothamBold,TextSize=11,BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},jSubBar)
+	corner(6,jb); jSubBtns[jt]=jb
+	local sp=makeFrame(pJerseys,UDim2.new(1,-16,1,-60),UDim2.new(0,8,0,56),C.bg0)
+	sp.BackgroundTransparency=1; sp.Visible=false; jSubPanels[jt]=sp
+	jb.MouseButton1Click:Connect(function() setJSub(jt) end)
+end
+
+local jMeScroll=makeScroll(jSubPanels["Me"],UDim2.new(1,0,1,0),nil,5)
+vlist(jMeScroll,8); padding(jMeScroll,0,4,0,10)
+
+local jGrpScroll=makeScroll(jSubPanels["Groups"],UDim2.new(1,0,1,0),nil,5)
+vlist(jGrpScroll,8); padding(jGrpScroll,0,4,0,10)
+
+local rebuildJMe, rebuildJGrp
+
+rebuildJMe=function()
+	clearChildren(jMeScroll)
+	local function mkC() local c=makeFrame(jMeScroll,UDim2.new(1,0,0,0),nil,C.bg1); c.AutomaticSize=Enum.AutomaticSize.Y; corner(8,c); stroke(c,C.bdr,1); padding(c,14,12,14,12); vlist(c,8); return c end
+	if #detectedJerseys==0 then
+		local c=mkC(); makeLabel(c,"No JERSEY_ accessories found.",13,C.dim,true); makeLabel(c,"Press ↺ SCAN to search your character for accessories prefixed JERSEY_",11,C.dim); return
+	end
+	local ic=mkC()
+	makeLabel(ic,#detectedJerseys.." jersey"..(#detectedJerseys==1 and "" or "s").." found on your character",12,C.off,true)
+	for _,accName in ipairs(detectedJerseys) do
+		local c=mkC(); makeLabel(c,accName,13,C.white,true)
+		local ti,_,_2=makeInput(c,"Paste texture ID  (rbxassetid://… or number)",36,6)
+		local ab=makeButton(c,"Apply Texture to "..accName,true,36,6)
+		ab.MouseButton1Click:Connect(function()
+			local nid=normTexId(ti.Text); if not nid then setStatus("Invalid texture ID",C.red); return end
+			task.spawn(function()
+				local char=player.Character; if not char then return end
+				local acc=char:FindFirstChild(accName); if not acc then setStatus(accName.." not found",C.red); return end
+				pcall(function() ContentProvider:PreloadAsync({nid}) end)
+				if swapTex(acc,nid) then setStatus("Applied to "..accName,C.green); tw(ab,{BackgroundColor3=C.green},TF); task.delay(2,function() if ab and ab.Parent then tw(ab,{BackgroundColor3=C.white},TF) end end)
+				else setStatus("Apply failed",C.red) end
+			end)
+		end)
+	end
+end
+
+rebuildJGrp=function()
+	clearChildren(jGrpScroll)
+	local function mkC() local c=makeFrame(jGrpScroll,UDim2.new(1,0,0,0),nil,C.bg1); c.AutomaticSize=Enum.AutomaticSize.Y; corner(8,c); stroke(c,C.bdr,1); padding(c,14,12,14,12); vlist(c,8); return c end
+
+	-- create group
+	local cc=mkC(); makeLabel(cc,"CREATE GROUP",9,C.dim,true)
+	local cr2=makeFrame(cc,UDim2.new(1,0,0,36),nil,C.bg0); cr2.BackgroundTransparency=1; hlist(cr2,8)
+	local ni2,_,_2=makeInput(cr2,"Group name",36,6); ni2.Size=UDim2.new(1,-100,0,36)
+	local cb2=makeButton(cr2,"Create",true,36,6); cb2.Size=UDim2.new(0,90,0,36)
+	cb2.MouseButton1Click:Connect(function()
+		local n=ni2.Text:match("^%s*(.-)%s*$"); if n=="" then return end
+		table.insert(groups,{name=n,slots={},players={}}); ni2.Text=""
+		rebuildJGrp(); setStatus("Group '"..n.."' created",C.green)
+	end)
+
+	-- pills
+	if #groups>0 then
+		local pc=mkC(); makeLabel(pc,"ACTIVE GROUP",9,C.dim,true)
+		local pr=makeFrame(pc,UDim2.new(1,0,0,0),nil,C.bg0); pr.BackgroundTransparency=1; pr.AutomaticSize=Enum.AutomaticSize.Y; hlist(pr,6)
+		for gi,grp in ipairs(groups) do
+			local on=(activeGroupIdx==gi)
+			local pb=G("TextButton",{Size=UDim2.new(0,0,0,28),AutomaticSize=Enum.AutomaticSize.X,BackgroundColor3=on and C.white or C.bg3,Text="  "..(on and "⚡ " or "")..grp.name.."  ",TextColor3=on and C.bg0 or C.dim,Font=Enum.Font.GothamBold,TextSize=11,BorderSizePixel=0,ZIndex=7},pr)
+			corner(99,pb); if not on then stroke(pb,C.bdr,1) end
+			pb.MouseButton1Click:Connect(function() activateGroup(gi); rebuildJGrp(); setStatus("'"..grp.name.."' activated",C.green) end)
+		end
+	end
+
+	local ag=activeGrp(); if not ag then return end
+
+	-- texture slots
+	local tc=mkC(); makeLabel(tc,ag.name.."  ·  Jersey Textures",12,C.green,true)
+	if #detectedJerseys==0 then makeLabel(tc,"No jerseys detected — press ↺ SCAN first",11,C.dim)
+	else
+		for _,accName in ipairs(detectedJerseys) do
+			local row=makeFrame(tc,UDim2.new(1,0,0,40),nil,C.bg0); row.BackgroundTransparency=1; hlist(row,8)
+			local nl=makeLabel(row,accName,11,C.off); nl.Size=UDim2.new(0,120,0,40); nl.TextYAlignment=Enum.TextYAlignment.Center
+			local ti2,_,_2=makeInput(row,ag.slots[accName] or "Texture ID",36,7); ti2.Size=UDim2.new(1,-210,0,36)
+			if ag.slots[accName] then ti2.Text=ag.slots[accName] end
+			local svb=makeButton(row,"Save",true,36,7); svb.Size=UDim2.new(0,76,0,36)
+			svb.MouseButton1Click:Connect(function()
+				local nid=normTexId(ti2.Text); if not nid then return end
+				ag.slots[accName]=nid; pcall(function() ContentProvider:PreloadAsync({nid}) end)
+				local pushed=0
+				for _,u in ipairs(ag.players) do for _,rp in ipairs(Players:GetPlayers()) do if rp.Name:lower()==u:lower() then local char=rp.Character; if char then local acc=char:FindFirstChild(accName); if acc then swapTex(acc,nid);pushed=pushed+1 end end end end end
+				setStatus("Saved"..( pushed>0 and "  ·  pushed to "..pushed.." player(s)" or ""),C.green)
+				tw(svb,{BackgroundColor3=C.green},TF); task.delay(2,function() if svb and svb.Parent then tw(svb,{BackgroundColor3=C.white},TF) end end)
+			end)
+		end
+	end
+
+	-- players
+	local plc=mkC(); makeLabel(plc,"PLAYERS  —  "..ag.name,9,C.dim,true)
+	for _,rp in ipairs(Players:GetPlayers()) do
+		local alrIn=false; for _,u in ipairs(ag.players) do if u:lower()==rp.Name:lower() then alrIn=true;break end end
+		local prow=makeFrame(plc,UDim2.new(1,0,0,36),nil,C.bg0); prow.BackgroundTransparency=1; hlist(prow,8)
+		local dot=makeFrame(prow,UDim2.new(0,7,0,7),nil,C.green,7); dot.LayoutOrder=1; corner(4,dot)
+		local un=makeLabel(prow,rp.Name,12,alrIn and C.dim or C.off,not alrIn); un.Size=UDim2.new(1,-110,0,36); un.LayoutOrder=2; un.TextYAlignment=Enum.TextYAlignment.Center
+		if not alrIn then
+			local ab2=makeButton(prow,"＋ Add",true,28,7); ab2.Size=UDim2.new(0,80,0,28); ab2.LayoutOrder=3
+			ab2.MouseButton1Click:Connect(function() table.insert(ag.players,rp.Name); pushChar(rp); rebuildJGrp(); setStatus("Added "..rp.Name,C.green) end)
+		else makeLabel(prow,"In Group",10,C.dim).Size=UDim2.new(0,80,0,36) end
+	end
+	makeLabel(plc,"Manual add (not in server)",9,C.dim,true)
+	local manRow=makeFrame(plc,UDim2.new(1,0,0,36),nil,C.bg0); manRow.BackgroundTransparency=1; hlist(manRow,8)
+	local manI,_,_2=makeInput(manRow,"Roblox username",36,7); manI.Size=UDim2.new(1,-100,0,36)
+	local manB=makeButton(manRow,"＋ Add",true,36,7); manB.Size=UDim2.new(0,90,0,36)
+	manB.MouseButton1Click:Connect(function()
+		local u=manI.Text:match("^%s*(.-)%s*$"); if u=="" then return end
+		table.insert(ag.players,u); manI.Text=""; rebuildJGrp(); setStatus("Added "..u,C.green)
+	end)
+	if #ag.players>0 then
+		makeLabel(plc,"Members ("..#ag.players..")",9,C.dim,true)
+		for pi,username in ipairs(ag.players) do
+			local isOnline=false; local oRp=nil
+			for _,rp in ipairs(Players:GetPlayers()) do if rp.Name:lower()==username:lower() then isOnline=true;oRp=rp;break end end
+			local mrow=makeFrame(plc,UDim2.new(1,0,0,36),nil,C.bg0); mrow.BackgroundTransparency=1; hlist(mrow,8)
+			local md=makeFrame(mrow,UDim2.new(0,7,0,7),nil,isOnline and C.green or C.muted,7); corner(4,md)
+			makeLabel(mrow,username,12,isOnline and C.off or C.dim,isOnline).Size=UDim2.new(1,-160,0,36)
+			if isOnline then local pb2=makeButton(mrow,"▶ Push",false,28,7); pb2.Size=UDim2.new(0,68,0,28); pb2.MouseButton1Click:Connect(function() pushChar(oRp); setStatus("Pushed to "..username,C.green) end) end
+			local rb=G("TextButton",{Size=UDim2.new(0,28,0,28),BackgroundColor3=C.rbg,Text="✕",TextColor3=C.red,Font=Enum.Font.GothamBold,TextSize=12,BorderSizePixel=0,AutoButtonColor=false,ZIndex=7},mrow)
+			corner(5,rb); stroke(rb,Color3.fromRGB(50,14,14),1)
+			rb.MouseButton1Click:Connect(function() table.remove(ag.players,pi); rebuildJGrp(); setStatus("Removed "..username) end)
+		end
+	end
+	-- delete group
+	local delF=makeFrame(jGrpScroll,UDim2.new(1,0,0,36),nil,C.bg0); delF.BackgroundTransparency=1
+	local delB=G("TextButton",{Size=UDim2.new(0,210,0,32),Position=UDim2.new(1,-210,0.5,-16),BackgroundColor3=C.rbg,Text="✕  Delete '"..ag.name.."'",TextColor3=C.red,Font=Enum.Font.GothamBold,TextSize=11,BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},delF)
+	corner(6,delB); stroke(delB,Color3.fromRGB(50,14,14),1)
+	delB.MouseButton1Click:Connect(function()
+		local nm=ag.name; table.remove(groups,activeGroupIdx); activeGroupIdx=#groups>0 and 1 or nil
+		if activeGroupIdx then activateGroup(activeGroupIdx) end; rebuildJGrp(); setStatus("Deleted '"..nm.."'")
+	end)
+end
+
+local function scanJerseys()
+	local char=player.Character; detectedJerseys={}
+	if not char then setStatus("No character",C.red); return end
+	for _,ch in ipairs(char:GetChildren()) do if ch:IsA("Accessory") and ch.Name:sub(1,7)=="JERSEY_" then table.insert(detectedJerseys,ch.Name) end end
+	table.sort(detectedJerseys)
+	local n=#detectedJerseys; setStatus(n.." jersey"..(n==1 and "" or "s").." found",n>0 and C.green or C.dim)
+	rebuildJMe(); rebuildJGrp()
+end
+
+jScanBtn.MouseButton1Click:Connect(scanJerseys)
+if player.Character then task.spawn(scanJerseys) end
+player.CharacterAdded:Connect(function() task.wait(0.7); scanJerseys() end)
+setJSub("Me")
+
+
+end -- section
+
+do -- section
+-- ====================================================================
+--[[  PANEL: UI EDITOR  ]]
+-- ====================================================================
+
+local pUIEditor = newPanel(); tabPanels["uieditor"]=pUIEditor
+
+-- Layout: left toolbox | center canvas | right inspector
+local uiLeft   = makeFrame(pUIEditor,UDim2.new(0,180,1,-16),UDim2.new(0,8,0,8),C.bg1); corner(8,uiLeft); stroke(uiLeft,C.bdr,1)
+local uiCenter = makeFrame(pUIEditor,UDim2.new(1,-400,1,-16),UDim2.new(0,196,0,8),C.bg2); corner(8,uiCenter); stroke(uiCenter,C.bdr,1)
+local uiRight  = makeFrame(pUIEditor,UDim2.new(0,186,1,-16),UDim2.new(1,-194,0,8),C.bg1); corner(8,uiRight); stroke(uiRight,C.bdr,1)
+
+-- Left header
+local uiLH=makeFrame(uiLeft,UDim2.new(1,0,0,34),UDim2.new(0,0,0,0),C.bg2); corner(8,uiLH)
+makeFrame(uiLH,UDim2.new(1,0,0,8),UDim2.new(0,0,1,-8),C.bg2,4)
+makeLabel(uiLH,"ELEMENTS",9,C.dim,true).Position=UDim2.new(0,10,0.5,-7)
+
+local uiLeftScroll=makeScroll(uiLeft,UDim2.new(1,-4,1,-42),UDim2.new(0,2,0,38),5)
+vlist(uiLeftScroll,4); padding(uiLeftScroll,8,6,6,8)
+
+-- Canvas
+local uiCanvasLabel=makeLabel(uiCenter,"CANVAS",9,C.dim,true)
+uiCanvasLabel.Position=UDim2.new(0,12,0,8); uiCanvasLabel.Size=UDim2.new(1,-60,0,14)
+
+local uiCanvas=makeFrame(uiCenter,UDim2.new(1,-20,1,-54),UDim2.new(0,10,0,36),Color3.fromRGB(18,18,28))
+corner(6,uiCanvas); stroke(uiCanvas,C.bdr,1)
+
+-- Canvas grid dots overlay
+local gridOverlay=makeFrame(uiCanvas,UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),C.bg0)
+gridOverlay.BackgroundTransparency=1; gridOverlay.ZIndex=1
+local gridGrad=G("UIGradient",{Color=ColorSequence.new{ColorSequenceKeypoint.new(0,Color3.fromRGB(22,22,32)),ColorSequenceKeypoint.new(1,Color3.fromRGB(14,14,22))},Rotation=135},gridOverlay)
+
+-- Export to playerGui button
+local uiExportBtn=G("TextButton",{Size=UDim2.new(0,100,0,22),Position=UDim2.new(1,-108,0,6),BackgroundColor3=C.white,Text="▶  Deploy",TextColor3=C.bg0,Font=Enum.Font.GothamBold,TextSize=10,BorderSizePixel=0,AutoButtonColor=false,ZIndex=7},uiCenter)
+corner(5,uiExportBtn)
+uiExportBtn.MouseEnter:Connect(function() tw(uiExportBtn,{BackgroundColor3=Color3.fromRGB(220,220,220)},TF) end)
+uiExportBtn.MouseLeave:Connect(function() tw(uiExportBtn,{BackgroundColor3=C.white},TF) end)
+
+-- Right inspector
+local uiRH=makeFrame(uiRight,UDim2.new(1,0,0,34),UDim2.new(0,0,0,0),C.bg2); corner(8,uiRH)
+makeFrame(uiRH,UDim2.new(1,0,0,8),UDim2.new(0,0,1,-8),C.bg2,4)
+makeLabel(uiRH,"INSPECTOR",9,C.dim,true).Position=UDim2.new(0,10,0.5,-7)
+
+local uiInspectorScroll=makeScroll(uiRight,UDim2.new(1,-4,1,-42),UDim2.new(0,2,0,38),5)
+vlist(uiInspectorScroll,6); padding(uiInspectorScroll,10,6,8,8)
+
+-- Element type buttons
+local UI_ELEMENTS={
+	{type="Frame",    icon="▭", label="Frame"},
+	{type="TextLabel",icon="T", label="Label"},
+	{type="TextButton",icon="⬡",label="Button"},
+	{type="ImageLabel",icon="🖼",label="Image"},
+	{type="ScrollingFrame",icon="≡",label="Scroll"},
+	{type="TextBox",  icon="✎", label="TextBox"},
+}
+
+local uiElementCount=0
+
+local function rebuildInspector()
+	clearChildren(uiInspectorScroll)
+	if not selectedElement or not selectedElement.ref or not selectedElement.ref.Parent then
+		makeLabel(uiInspectorScroll,"No element selected.",11,C.dim); return
+	end
+	local el=selectedElement; local ref=el.ref
+
+	sectionHeader(uiInspectorScroll,"POSITION & SIZE")
+
+	local function propRow(lbl,val,onChanged)
+		local row=makeFrame(uiInspectorScroll,UDim2.new(1,0,0,46),nil,C.bg0); row.BackgroundTransparency=1; vlist(row,2)
+		makeLabel(row,lbl,9,C.dim,true)
+		local tb2,_,_2=makeInput(row,val,32,6); tb2.Text=val; tb2.TextSize=11
+		tb2.FocusLost:Connect(function() onChanged(tb2.Text) end)
+		return tb2
+	end
+
+	propRow("X  (offset, e.g. 100)",tostring(el.x or 20),function(v) local n=tonumber(v); if n then el.x=n; ref.Position=UDim2.new(0,el.x,0,el.y) end end)
+	propRow("Y  (offset, e.g. 50)",tostring(el.y or 20),function(v) local n=tonumber(v); if n then el.y=n; ref.Position=UDim2.new(0,el.x,0,el.y) end end)
+	propRow("Width",tostring(el.w or 120),function(v) local n=tonumber(v); if n then el.w=n; ref.Size=UDim2.new(0,el.w,0,el.h) end end)
+	propRow("Height",tostring(el.h or 40),function(v) local n=tonumber(v); if n then el.h=n; ref.Size=UDim2.new(0,el.w,0,el.h) end end)
+
+	sectionHeader(uiInspectorScroll,"APPEARANCE")
+	propRow("Background Color (R,G,B)",string.format("%d,%d,%d",math.floor(el.bgCol.R*255),math.floor(el.bgCol.G*255),math.floor(el.bgCol.B*255)),function(v)
+		local r,g,b=v:match("(%d+),(%d+),(%d+)"); if r then el.bgCol=Color3.fromRGB(tonumber(r),tonumber(g),tonumber(b)); ref.BackgroundColor3=el.bgCol end
+	end)
+	propRow("Corner Radius (px)",tostring(el.cornerR or 0),function(v) local n=tonumber(v); if n then el.cornerR=n; local uc=ref:FindFirstChildOfClass("UICorner"); if uc then uc.CornerRadius=UDim.new(0,n) else corner(n,ref) end end end)
+	propRow("Transparency (0-1)",tostring(el.transp or 0),function(v) local n=tonumber(v); if n then el.transp=n; ref.BackgroundTransparency=n end end)
+
+	if el.type=="TextLabel" or el.type=="TextButton" or el.type=="TextBox" then
+		sectionHeader(uiInspectorScroll,"TEXT")
+		propRow("Text",el.text or "",function(v) el.text=v; pcall(function() ref.Text=v end) end)
+		propRow("Text Size",tostring(el.textSize or 14),function(v) local n=tonumber(v); if n then el.textSize=n; pcall(function() ref.TextSize=n end) end end)
+		propRow("Text Color (R,G,B)",string.format("%d,%d,%d",math.floor((el.textCol or C.white).R*255),math.floor((el.textCol or C.white).G*255),math.floor((el.textCol or C.white).B*255)),function(v)
+			local r2,g2,b2=v:match("(%d+),(%d+),(%d+)"); if r2 then el.textCol=Color3.fromRGB(tonumber(r2),tonumber(g2),tonumber(b2)); pcall(function() ref.TextColor3=el.textCol end) end
+		end)
+	end
+
+	sectionHeader(uiInspectorScroll,"ACTIONS")
+	local delBtnI=makeButton(uiInspectorScroll,"Delete Element",false,32,6)
+	delBtnI.TextColor3=C.red
+	delBtnI.MouseButton1Click:Connect(function()
+		if ref and ref.Parent then ref:Destroy() end
+		for i,e in ipairs(uiEditorElements) do if e==el then table.remove(uiEditorElements,i);break end end
+		selectedElement=nil; rebuildInspector()
+	end)
+end
+
+local function addUIElement(etype)
+	uiElementCount=uiElementCount+1
+	local el={
+		type=etype, id=uiElementCount, name=etype.."_"..uiElementCount,
+		x=20+math.random(0,60), y=20+math.random(0,60), w=120, h=40,
+		bgCol=Color3.fromRGB(30,30,30), cornerR=6, transp=0,
+		text=etype, textSize=14, textCol=C.white,
+	}
+
+	local ref=G(etype,{
+		Size=UDim2.new(0,el.w,0,el.h), Position=UDim2.new(0,el.x,0,el.y),
+		BackgroundColor3=el.bgCol, BorderSizePixel=0, ZIndex=10,
+		Active=true, Draggable=false,
+	},uiCanvas)
+	pcall(function() ref.Text=etype end)
+	pcall(function() ref.TextColor3=C.off end)
+	pcall(function() ref.Font=Enum.Font.GothamBold end)
+	pcall(function() ref.TextSize=14 end)
+	pcall(function() ref.AutoButtonColor=false end)
+	corner(6,ref)
+	stroke(ref,C.bdrHi,1)
+	el.ref=ref
+	table.insert(uiEditorElements,el)
+
+	-- click to select
+	ref.InputBegan:Connect(function(inp)
+		if inp.UserInputType==Enum.UserInputType.MouseButton1 then
+			selectedElement=el
+			-- deselect others
+			for _,e in ipairs(uiEditorElements) do
+				local sk2=e.ref and e.ref:FindFirstChildOfClass("UIStroke")
+				if sk2 then sk2.Color=C.bdrHi end
+			end
+			local sk3=ref:FindFirstChildOfClass("UIStroke"); if sk3 then sk3.Color=C.white end
+			rebuildInspector()
+		end
+	end)
+
+	-- drag on canvas
+	local draggingEl=false; local dOX,dOY=0,0
+	ref.InputBegan:Connect(function(inp)
+		if inp.UserInputType==Enum.UserInputType.MouseButton1 then
+			draggingEl=true; dOX=inp.Position.X-ref.AbsolutePosition.X; dOY=inp.Position.Y-ref.AbsolutePosition.Y
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(inp)
+		if draggingEl and inp.UserInputType==Enum.UserInputType.MouseMovement then
+			local cx=uiCanvas.AbsolutePosition.X; local cy=uiCanvas.AbsolutePosition.Y
+			local nx=math.clamp(inp.Position.X-cx-dOX,0,uiCanvas.AbsoluteSize.X-el.w)
+			local ny=math.clamp(inp.Position.Y-cy-dOY,0,uiCanvas.AbsoluteSize.Y-el.h)
+			el.x=math.floor(nx); el.y=math.floor(ny)
+			ref.Position=UDim2.new(0,el.x,0,el.y)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(inp)
+		if inp.UserInputType==Enum.UserInputType.MouseButton1 then draggingEl=false; rebuildInspector() end
+	end)
+
+	-- entry in left list
+	local listEntry=G("TextButton",{Size=UDim2.new(1,0,0,32),BackgroundColor3=C.bg2,Text="",BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},uiLeftScroll)
+	corner(6,listEntry); stroke(listEntry,C.bdr,1)
+	padding(listEntry,8,0,8,0); hlist(listEntry,8)
+	makeLabel(listEntry,el.name,10,C.off,false).Size=UDim2.new(1,-0,0,32)
+	el.listEntry=listEntry
+	listEntry.MouseButton1Click:Connect(function() selectedElement=el; for _,e in ipairs(uiEditorElements) do local sk2=e.ref and e.ref:FindFirstChildOfClass("UIStroke"); if sk2 then sk2.Color=C.bdrHi end end; local sk3=ref:FindFirstChildOfClass("UIStroke"); if sk3 then sk3.Color=C.white end; rebuildInspector() end)
+	listEntry.MouseEnter:Connect(function() if selectedElement~=el then tw(listEntry,{BackgroundColor3=C.hover},TF) end end)
+	listEntry.MouseLeave:Connect(function() tw(listEntry,{BackgroundColor3=C.bg2},TF) end)
+
+	selectedElement=el; rebuildInspector()
+end
+
+-- Element add buttons
+sectionHeader(uiLeftScroll,"ADD ELEMENT")
+for _,et in ipairs(UI_ELEMENTS) do
+	local eb=G("TextButton",{Size=UDim2.new(1,0,0,34),BackgroundColor3=C.bg2,Text=et.icon.."  "..et.label,TextColor3=C.off,Font=Enum.Font.GothamBold,TextSize=11,BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},uiLeftScroll)
+	corner(6,eb); stroke(eb,C.bdr,1)
+	eb.MouseEnter:Connect(function() tw(eb,{BackgroundColor3=C.hover,TextColor3=C.white},TF) end)
+	eb.MouseLeave:Connect(function() tw(eb,{BackgroundColor3=C.bg2,TextColor3=C.off},TF) end)
+	eb.MouseButton1Click:Connect(function() addUIElement(et.type) end)
+end
+
+sectionHeader(uiLeftScroll,"TOOLS")
+local clrCanvasBtn=makeButton(uiLeftScroll,"Clear Canvas",false,32,6)
+clrCanvasBtn.MouseButton1Click:Connect(function()
+	for _,e in ipairs(uiEditorElements) do if e.ref and e.ref.Parent then e.ref:Destroy() end; if e.listEntry and e.listEntry.Parent then e.listEntry:Destroy() end end
+	uiEditorElements={}; selectedElement=nil; rebuildInspector(); setStatus("Canvas cleared")
+end)
+
+uiExportBtn.MouseButton1Click:Connect(function()
+	if #uiEditorElements==0 then setStatus("Add elements first",C.red); return end
+	local deployGui=Instance.new("ScreenGui"); deployGui.Name="VybeUIExport"; deployGui.ResetOnSpawn=false; deployGui.Parent=playerGui
+	for _,el in ipairs(uiEditorElements) do
+		if el.ref and el.ref.Parent then
+			local clone=el.ref:Clone(); clone.Position=UDim2.new(0,el.x,0,el.y); clone.ZIndex=20; clone.Parent=deployGui
+		end
+	end
+	setStatus("UI deployed to PlayerGui as VybeUIExport!",C.green)
+end)
+
+makeLabel(uiInspectorScroll,"Select an element on the canvas to inspect and edit its properties.",11,C.dim)
+
+
+end -- section
+
+do -- section
+-- ====================================================================
+--[[  PANEL: PROP DESIGNER  ]]
+-- ====================================================================
+
+local pProp = newPanel(); tabPanels["propdesign"]=pProp
+
+local propLeft  = makeFrame(pProp,UDim2.new(0,200,1,-16),UDim2.new(0,8,0,8),C.bg1); corner(8,propLeft); stroke(propLeft,C.bdr,1)
+local propRight = makeFrame(pProp,UDim2.new(1,-220,1,-16),UDim2.new(0,216,0,8),C.bg1); corner(8,propRight); stroke(propRight,C.bdr,1)
+
+local propLH=makeFrame(propLeft,UDim2.new(1,0,0,34),UDim2.new(0,0,0,0),C.bg2); corner(8,propLH); makeFrame(propLH,UDim2.new(1,0,0,8),UDim2.new(0,0,1,-8),C.bg2,4); makeLabel(propLH,"PROP PARTS",9,C.dim,true).Position=UDim2.new(0,10,0.5,-7)
+
+local propPartsList=makeScroll(propLeft,UDim2.new(1,-4,1,-80),UDim2.new(0,2,0,38),5)
+vlist(propPartsList,4); padding(propPartsList,8,6,6,8)
+
+-- Add part buttons
+local propAddBtns=makeFrame(propLeft,UDim2.new(1,0,0,40),UDim2.new(0,0,1,-40),C.bg2)
+padding(propAddBtns,8,4,8,4); hlist(propAddBtns,4)
+makeFrame(propLeft,UDim2.new(1,0,0,1),UDim2.new(0,0,1,-41),C.bdr,4)
+local addBlockBtn=makeSmallBtn(propAddBtns,"＋ Block",C.bg3,C.off,82,30)
+local addCylBtn  =makeSmallBtn(propAddBtns,"＋ Cyl",  C.bg3,C.off,80,30)
+local addSphBtn  =makeSmallBtn(propAddBtns,"＋ Sph",  C.bg3,C.off,80,30)
+
+-- Right: properties panel
+local propRH=makeFrame(propRight,UDim2.new(1,0,0,34),UDim2.new(0,0,0,0),C.bg2); corner(8,propRH); makeFrame(propRH,UDim2.new(1,0,0,8),UDim2.new(0,0,1,-8),C.bg2,4); makeLabel(propRH,"PART PROPERTIES",9,C.dim,true).Position=UDim2.new(0,10,0.5,-7)
+
+local propInspScroll=makeScroll(propRight,UDim2.new(1,-4,1,-42),UDim2.new(0,2,0,38),5)
+vlist(propInspScroll,6); padding(propInspScroll,10,6,8,8)
+
+-- Action row at bottom of right
+local propActRow=makeFrame(propRight,UDim2.new(1,-20,0,36),UDim2.new(0,10,1,-42),C.bg0); propActRow.BackgroundTransparency=1; hlist(propActRow,8)
+local exportPropBtn=makeButton(propActRow,"⬆  Export to Workspace",true,36,6,11); exportPropBtn.Size=UDim2.new(0.6,-4,0,36)
+local clearPropBtn=makeButton(propActRow,"✕ Clear All",false,36,6,10); clearPropBtn.Size=UDim2.new(0.4,-4,0,36)
+
+local propPartCount=0
+
+local function rebuildPropInspector()
+	clearChildren(propInspScroll)
+	if not selectedProp then makeLabel(propInspScroll,"Select a part from the list to edit it.",11,C.dim); return end
+	local sp=selectedProp
+	if not sp.part or not sp.part.Parent then makeLabel(propInspScroll,"Part no longer exists.",11,C.dim); return end
+
+	local function pRow(lbl,val,onSet)
+		local row=makeFrame(propInspScroll,UDim2.new(1,0,0,48),nil,C.bg0); row.BackgroundTransparency=1; vlist(row,2)
+		makeLabel(row,lbl,9,C.dim,true)
+		local tb2,_,_2=makeInput(row,val,32,6); tb2.Text=val; tb2.TextSize=11
+		tb2.FocusLost:Connect(function() onSet(tb2.Text) end)
+		return tb2
+	end
+
+	sectionHeader(propInspScroll,"TRANSFORM")
+	pRow("Size X",tostring(math.floor(sp.part.Size.X*100)/100),function(v) local n=tonumber(v); if n and n>0 then sp.part.Size=Vector3.new(n,sp.part.Size.Y,sp.part.Size.Z) end end)
+	pRow("Size Y",tostring(math.floor(sp.part.Size.Y*100)/100),function(v) local n=tonumber(v); if n and n>0 then sp.part.Size=Vector3.new(sp.part.Size.X,n,sp.part.Size.Z) end end)
+	pRow("Size Z",tostring(math.floor(sp.part.Size.Z*100)/100),function(v) local n=tonumber(v); if n and n>0 then sp.part.Size=Vector3.new(sp.part.Size.X,sp.part.Size.Y,n) end end)
+	pRow("Pos X",tostring(math.floor(sp.part.Position.X*100)/100),function(v) local n=tonumber(v); if n then sp.part.CFrame=CFrame.new(n,sp.part.Position.Y,sp.part.Position.Z) end end)
+	pRow("Pos Y",tostring(math.floor(sp.part.Position.Y*100)/100),function(v) local n=tonumber(v); if n then sp.part.CFrame=CFrame.new(sp.part.Position.X,n,sp.part.Position.Z) end end)
+	pRow("Pos Z",tostring(math.floor(sp.part.Position.Z*100)/100),function(v) local n=tonumber(v); if n then sp.part.CFrame=CFrame.new(sp.part.Position.X,sp.part.Position.Y,n) end end)
+
+	sectionHeader(propInspScroll,"APPEARANCE")
+	pRow("Color (R,G,B)",string.format("%d,%d,%d",math.floor(sp.part.Color.R*255),math.floor(sp.part.Color.G*255),math.floor(sp.part.Color.B*255)),function(v)
+		local r2,g2,b2=v:match("(%d+),(%d+),(%d+)"); if r2 then sp.part.Color=Color3.fromRGB(tonumber(r2),tonumber(g2),tonumber(b2)) end
+	end)
+	pRow("Material",sp.part.Material.Name,function(v) pcall(function() sp.part.Material=Enum.Material[v] end) end)
+	pRow("Transparency (0-1)",tostring(sp.part.Transparency),function(v) local n=tonumber(v); if n then sp.part.Transparency=math.clamp(n,0,1) end end)
+	pRow("Reflectance (0-1)",tostring(sp.part.Reflectance),function(v) local n=tonumber(v); if n then sp.part.Reflectance=math.clamp(n,0,1) end end)
+
+	sectionHeader(propInspScroll,"PHYSICS")
+	pRow("Anchored","true",function(v) sp.part.Anchored=(v:lower()=="true") end)
+	pRow("Can Collide","true",function(v) sp.part.CanCollide=(v:lower()=="true") end)
+	pRow("Cast Shadow","true",function(v) sp.part.CastShadow=(v:lower()=="true") end)
+
+	sectionHeader(propInspScroll,"ACTIONS")
+	local delPartBtn=makeButton(propInspScroll,"Delete Part",false,32,6)
+	delPartBtn.TextColor3=C.red
+	delPartBtn.MouseButton1Click:Connect(function()
+		if sp.part and sp.part.Parent then sp.part:Destroy() end
+		if sp.listBtn and sp.listBtn.Parent then sp.listBtn:Destroy() end
+		for i,p in ipairs(propParts) do if p==sp then table.remove(propParts,i);break end end
+		selectedProp=nil; rebuildPropInspector(); setStatus("Part deleted")
+	end)
+	local dupBtn=makeButton(propInspScroll,"Duplicate Part",false,32,6)
+	dupBtn.MouseButton1Click:Connect(function()
+		if sp.part and sp.part.Parent then
+			local clone=sp.part:Clone(); clone.CFrame=sp.part.CFrame+Vector3.new(4,0,0); clone.Parent=workspace
+			propPartCount=propPartCount+1
+			local nsp={part=clone,name="Part_"..propPartCount}
+			table.insert(propParts,nsp)
+			local lb=G("TextButton",{Size=UDim2.new(1,0,0,30),BackgroundColor3=C.bg2,Text=nsp.name,TextColor3=C.off,Font=Enum.Font.GothamBold,TextSize=10,BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},propPartsList)
+			corner(6,lb); stroke(lb,C.bdr,1); padding(lb,8,0,0,0); nsp.listBtn=lb
+			lb.MouseButton1Click:Connect(function() selectedProp=nsp; rebuildPropInspector() end)
+			lb.MouseEnter:Connect(function() tw(lb,{BackgroundColor3=C.hover},TF) end)
+			lb.MouseLeave:Connect(function() tw(lb,{BackgroundColor3=C.bg2},TF) end)
+			selectedProp=nsp; rebuildPropInspector(); setStatus("Duplicated part",C.green)
+		end
+	end)
+end
+
+local function addPropPart(shape)
+	propPartCount=propPartCount+1
+	local part=Instance.new("Part")
+	part.Name="VybeProp_"..propPartCount
+	part.Size=Vector3.new(4,4,4)
+	part.Anchored=true
+	part.CanCollide=true
+	part.Color=Color3.fromRGB(180,180,180)
+	part.Material=Enum.Material.SmoothPlastic
+	if shape=="Cylinder" then part.Shape=Enum.PartType.Cylinder
+	elseif shape=="Sphere" then part.Shape=Enum.PartType.Ball end
+
+	-- place near player or center
+	local char=player.Character
+	if char and char:FindFirstChild("HumanoidRootPart") then
+		local hrp=char.HumanoidRootPart; part.CFrame=hrp.CFrame*CFrame.new(0,4,-8+propPartCount*0.5)
+	else part.Position=Vector3.new(propPartCount*5,5,0) end
+	part.Parent=workspace
+
+	local sp={part=part, name=part.Name}
+	table.insert(propParts,sp)
+
+	local lb=G("TextButton",{Size=UDim2.new(1,0,0,30),BackgroundColor3=C.bg2,Text=part.Name,TextColor3=C.off,Font=Enum.Font.GothamBold,TextSize=10,BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},propPartsList)
+	corner(6,lb); stroke(lb,C.bdr,1); padding(lb,8,0,0,0); sp.listBtn=lb
+	lb.MouseButton1Click:Connect(function() selectedProp=sp; rebuildPropInspector() end)
+	lb.MouseEnter:Connect(function() tw(lb,{BackgroundColor3=C.hover},TF) end)
+	lb.MouseLeave:Connect(function() tw(lb,{BackgroundColor3=C.bg2},TF) end)
+	selectedProp=sp; rebuildPropInspector()
+	setStatus("Added "..part.Name.." to workspace",C.green)
+end
+
+addBlockBtn.MouseButton1Click:Connect(function() addPropPart("Block") end)
+addCylBtn.MouseButton1Click:Connect(function() addPropPart("Cylinder") end)
+addSphBtn.MouseButton1Click:Connect(function() addPropPart("Sphere") end)
+
+exportPropBtn.MouseButton1Click:Connect(function()
+	if #propParts==0 then setStatus("Add some parts first",C.red); return end
+	local model=Instance.new("Model"); model.Name="VybePropDesign"
+	local valid=0
+	for _,sp in ipairs(propParts) do
+		if sp.part and sp.part.Parent then sp.part:Clone().Parent=model; valid=valid+1 end
+	end
+	model.Parent=workspace
+	setStatus(string.format("Exported %d parts as VybePropDesign model",valid),C.green)
+end)
+
+clearPropBtn.MouseButton1Click:Connect(function()
+	for _,sp in ipairs(propParts) do
+		if sp.part and sp.part.Parent then sp.part:Destroy() end
+		if sp.listBtn and sp.listBtn.Parent then sp.listBtn:Destroy() end
+	end
+	propParts={}; selectedProp=nil; rebuildPropInspector(); setStatus("Prop canvas cleared")
+end)
+
+makeLabel(propInspScroll,"Add a Block, Cylinder, or Sphere then click it in the list to edit properties.",11,C.dim)
+makeLabel(propInspScroll,"",9,C.dim)
+makeLabel(propInspScroll,"Materials: SmoothPlastic · Neon · Metal · Glass · Brick · Grass · Ice · Sand · Wood · DiamondPlate",10,C.dim)
+
+
+end -- section
+
+do -- section
+-- ====================================================================
+--[[  PANEL: MARKETPLACE  ]]
+-- ====================================================================
+
+local pMarket = newPanel(); tabPanels["market"]=pMarket
+
+-- filter bar
+local mktFBar=makeFrame(pMarket,UDim2.new(1,-16,0,42),UDim2.new(0,8,0,8),C.bg1)
+corner(8,mktFBar); stroke(mktFBar,C.bdr,1); hlist(mktFBar,6); padding(mktFBar,8,6,8,6)
+
+local activeCat="All"
+local catBtns={}
+
+for _,cat in ipairs(MKT_CATS) do
+	local on=(cat==activeCat)
+	local cb=G("TextButton",{Size=UDim2.new(0,0,1,0),AutomaticSize=Enum.AutomaticSize.X,BackgroundColor3=on and C.white or C.bg3,Text="  "..cat.."  ",TextColor3=on and C.bg0 or C.dim,Font=Enum.Font.GothamBold,TextSize=11,BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},mktFBar)
+	corner(6,cb); if not on then stroke(cb,C.bdr,1) end; catBtns[cat]=cb
+	cb.MouseButton1Click:Connect(function()
+		activeCat=cat
+		for c2,b2 in pairs(catBtns) do tw(b2,{BackgroundColor3=(c2==cat and C.white or C.bg3),TextColor3=(c2==cat and C.bg0 or C.dim)},TF) end
+		-- filter will fire via search rebuild
+	end)
+end
+
+-- search row
+local mktSRow=makeFrame(pMarket,UDim2.new(1,-16,0,38),UDim2.new(0,8,0,56),C.bg0); mktSRow.BackgroundTransparency=1
+mktSTb,_,_2=makeInput(mktSRow,"Search assets...",38,5); mktSTb.Size=UDim2.new(1,0,1,0)
+
+-- grid scroll
+local mktScroll=makeScroll(pMarket,UDim2.new(1,-16,1,-108),UDim2.new(0,8,0,100),4)
+mktGrid=makeFrame(mktScroll,UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),C.bg0)
+mktGrid.BackgroundTransparency=1; mktGrid.AutomaticSize=Enum.AutomaticSize.Y
+local mktGL=G("UIGridLayout",{CellSize=UDim2.new(0.245,-6,0,230),CellPaddingX=UDim.new(0,6),CellPaddingY=UDim.new(0,6),SortOrder=Enum.SortOrder.LayoutOrder},mktGrid)
+
+buildMarket=function()
+	clearChildren(mktGrid)
+	local q=mktSTb.Text:lower()
+	for idx,item in ipairs(MKT) do
+		if (activeCat=="All" or item.cat==activeCat) and (q=="" or item.name:lower():find(q,1,true) or item.desc:lower():find(q,1,true)) then
+			local card=makeFrame(mktGrid,UDim2.new(0,0,0,0),nil,C.bg1); card.AutomaticSize=Enum.AutomaticSize.None
+			corner(8,card); stroke(card,C.bdr,1); card.LayoutOrder=idx
+
+			-- top colored band
+			local band=makeFrame(card,UDim2.new(1,0,0,3),UDim2.new(0,0,0,0),C.white,5)
+			local bandG=G("UIGradient",{Color=ColorSequence.new{ColorSequenceKeypoint.new(0,Color3.fromRGB(40,40,40)),ColorSequenceKeypoint.new(0.5,C.white),ColorSequenceKeypoint.new(1,Color3.fromRGB(40,40,40))}},band)
+
+			-- cat pill
+			local cp=makePill(card,item.cat,C.bg3,C.dim)
+			cp.Position=UDim2.new(0,8,0,10); cp.ZIndex=7
+
+			-- free pill
+			local fp=makePill(card,"FREE",C.gbg,C.green)
+			fp.Position=UDim2.new(1,-fp.AbsoluteSize.X-8,0,10); fp.ZIndex=7
+
+			G("TextLabel",{Size=UDim2.new(1,-16,0,40),Position=UDim2.new(0,8,0,36),BackgroundTransparency=1,Text=item.name,TextColor3=C.white,Font=Enum.Font.GothamBold,TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,TextWrapped=true,ZIndex=5},card)
+			G("TextLabel",{Size=UDim2.new(1,-16,0,36),Position=UDim2.new(0,8,0,78),BackgroundTransparency=1,Text=item.desc,TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=10,TextXAlignment=Enum.TextXAlignment.Left,TextWrapped=true,ZIndex=5},card)
+			G("TextLabel",{Size=UDim2.new(1,-16,0,14),Position=UDim2.new(0,8,0,116),BackgroundTransparency=1,Text="ID: "..item.id,TextColor3=C.muted,Font=Enum.Font.Code,TextSize=9,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=5},card)
+
+			-- divider
+			makeFrame(card,UDim2.new(1,-16,0,1),UDim2.new(0,8,0,134),C.bdr,5)
+
+			-- import btn
+			local impB=G("TextButton",{Size=UDim2.new(1,-16,0,32),Position=UDim2.new(0,8,0,142),BackgroundColor3=C.white,Text="⬆  Import",TextColor3=C.bg0,Font=Enum.Font.GothamBold,TextSize=11,BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},card)
+			corner(6,impB)
+			impB.MouseEnter:Connect(function() tw(impB,{BackgroundColor3=Color3.fromRGB(220,220,220)},TF) end)
+			impB.MouseLeave:Connect(function() tw(impB,{BackgroundColor3=C.white},TF) end)
+			impB.MouseButton1Click:Connect(function()
+				setTab("import"); impIdTb.Text=item.id; setStatus("Click IMPORT ASSET to load: "..item.name,C.dim)
+			end)
+
+			local qkB=G("TextButton",{Size=UDim2.new(1,-16,0,30),Position=UDim2.new(0,8,0,178),BackgroundColor3=C.bg3,Text="⚡ Quick Import",TextColor3=C.off,Font=Enum.Font.GothamBold,TextSize=10,BorderSizePixel=0,AutoButtonColor=false,ZIndex=6},card)
+			corner(6,qkB); stroke(qkB,C.bdr,1)
+			qkB.MouseEnter:Connect(function() tw(qkB,{BackgroundColor3=C.hover},TF) end)
+			qkB.MouseLeave:Connect(function() tw(qkB,{BackgroundColor3=C.bg3},TF) end)
+			qkB.MouseButton1Click:Connect(function() doImportAsset(item.id) end)
+		end
+	end
+end
+
+buildMarket()
+mktSTb:GetPropertyChangedSignal("Text"):Connect(buildMarket)
+
+
+end -- section
+
+-- ====================================================================
+--[[  DRAGGING THE MAIN WINDOW  ]]
+-- ====================================================================
+
+local dragging,dragInput,dragStart,dragStartPos=false,nil,nil,nil
+topHeader.InputBegan:Connect(function(inp)
+	if inp.UserInputType==Enum.UserInputType.MouseButton1 or inp.UserInputType==Enum.UserInputType.Touch then
+		dragging=true; dragStart=inp.Position; dragStartPos=win.Position
+		inp.Changed:Connect(function() if inp.UserInputState==Enum.UserInputState.End then dragging=false end end)
+	end
+end)
+topHeader.InputChanged:Connect(function(inp)
+	if inp.UserInputType==Enum.UserInputType.MouseMovement or inp.UserInputType==Enum.UserInputType.Touch then dragInput=inp end
+end)
+UserInputService.InputChanged:Connect(function(inp)
+	if inp==dragInput and dragging then
+		local d=inp.Position-dragStart
+		win.Position=UDim2.new(dragStartPos.X.Scale,dragStartPos.X.Offset+d.X,dragStartPos.Y.Scale,dragStartPos.Y.Offset+d.Y)
+	end
+end)
+
+-- ====================================================================
+--[[  OPEN ANIMATION & INITIAL TAB  ]]
+-- ====================================================================
+
+win.Size=UDim2.new(0,0,0,0)
+win.Position=UDim2.new(0.5,0,0.5,0)
+win.BackgroundTransparency=1
+
+task.wait(0.06)
+TweenService:Create(win,TweenInfo.new(0.45,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{
+	Size=UDim2.new(0,WIN_W,0,WIN_H),
+	Position=UDim2.new(0.5,-WIN_W/2,0.5,-WIN_H/2),
+	BackgroundTransparency=0,
+}):Play()
+
+setTab("import")
+setStatus("Welcome to Vybe Streaming v2!  Select a tab on the left to begin.",C.dim)
